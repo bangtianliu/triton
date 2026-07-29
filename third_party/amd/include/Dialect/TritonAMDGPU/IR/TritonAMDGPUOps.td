@@ -727,7 +727,7 @@ def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
   let summary = "Commit native vector MFMA fragments with live dependencies";
   let description = [{
     Returns every input unchanged after applying the architecture-defined MFMA
-    result hazard. One or more inputs must be direct vector-storage
+    result hazard. One or more inputs must be direct transient
     `scheduled_mfma` results. Additional dot operands are non-numerical live
     dependencies, and their corresponding outputs must be consumed by the
     following source stage. Multiple independent native results can therefore
@@ -764,9 +764,10 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
 
     `resident_operand` is `none`, `lhs`, or `rhs` and identifies an input
     intentionally carried through the surrounding software pipeline.
-    `accumulator_storage`
-    is `vector` for a transient result or `matrix` for a persistent matrix
-    accumulator. `initialize` starts the native accumulators from zero.
+    `accumulator_role` is `transient` for a phase-local result or `persistent`
+    for an accumulator carried across phases. Target lowering selects the
+    corresponding storage. `initialize` starts the native accumulators from
+    zero.
     Completion of transient result fragments is represented separately by
     `mfma_commit`, which can cover multiple independent chains and live
     dependencies with one boundary. These scheduling roles are reusable across
@@ -783,13 +784,13 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
   }];
 
   let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,
-      StrAttr:$resident_operand, StrAttr:$accumulator_storage,
+      StrAttr:$resident_operand, StrAttr:$accumulator_role,
       BoolAttr:$initialize);
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
     $a `,` $b `,` $acc `resident` $resident_operand
-    `accumulator` $accumulator_storage `initialize` $initialize
+    `accumulator` $accumulator_role `initialize` $initialize
     attr-dict `:` type($a) `,` type($b) `,` type($acc) `->` type($result)
   }];
 

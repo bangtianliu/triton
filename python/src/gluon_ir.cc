@@ -1201,15 +1201,15 @@ void init_gluon_ir(py::module_ &m) {
       .def("create_scheduled_mfma",
            [](GluonOpBuilder &self, Type resultType, Value a, Value b,
               Value acc, const std::string &residentOperand,
-              const std::string &accumulatorStorage, bool initialize) -> Value {
+              const std::string &accumulatorRole, bool initialize) -> Value {
              auto residentOperandAttr =
                  self.getBuilder().getStringAttr(residentOperand);
-             auto accumulatorStorageAttr =
-                 self.getBuilder().getStringAttr(accumulatorStorage);
+             auto accumulatorRoleAttr =
+                 self.getBuilder().getStringAttr(accumulatorRole);
              auto initializeAttr = self.getBuilder().getBoolAttr(initialize);
              return self.create<ttag::ScheduledMfmaOp>(
                  resultType, a, b, acc, residentOperandAttr,
-                 accumulatorStorageAttr, initializeAttr);
+                 accumulatorRoleAttr, initializeAttr);
            })
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Type resultTy, Value &base,

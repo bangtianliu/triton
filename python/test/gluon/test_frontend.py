@@ -3761,7 +3761,7 @@ def scheduled_mfma_kernel():
         b,
         acc,
         resident_operand=1,
-        accumulator="vector",
+        accumulator="transient",
         initialize=True,
     )
     result1 = ttgl.amd.cdna4.scheduled_mfma(
@@ -3769,7 +3769,7 @@ def scheduled_mfma_kernel():
         b,
         acc,
         resident_operand=1,
-        accumulator="vector",
+        accumulator="transient",
         initialize=True,
     )
     result0, result1, b = ttgl.amd.cdna4.commit_mfma(
@@ -3803,7 +3803,9 @@ def invalid_matrix_mfma_commit_kernel():
     a = ttgl.full([16, 32], 1.0, ttgl.bfloat16, a_layout)
     b = ttgl.full([32, 16], 1.0, ttgl.bfloat16, b_layout)
     acc = ttgl.zeros([16, 16], ttgl.float32, mfma_layout)
-    result = ttgl.amd.cdna4.scheduled_mfma(a, b, acc, accumulator="matrix")
+    result = ttgl.amd.cdna4.scheduled_mfma(
+        a, b, acc, accumulator="persistent"
+    )
     ttgl.amd.cdna4.commit_mfma(result, preserve=b)
 
 
@@ -3814,7 +3816,7 @@ def test_amd_mfma_commit_rejects_matrix_source(capfd):
             *make_args(num_warps=1),
             target=HIP_TARGET_CDNA4,
         )
-    assert "must be a direct vector-storage scheduled_mfma result" in capfd.readouterr().err
+    assert "must be a direct transient scheduled_mfma result" in capfd.readouterr().err
 
 
 @gluon.jit
@@ -3836,8 +3838,12 @@ def invalid_scheduled_mfma_kernel(RESIDENT: ttgl.constexpr, ACCUMULATOR: ttgl.co
 @pytest.mark.parametrize(
     ("resident", "accumulator", "message"),
     [
-        (2, "matrix", "resident_operand must be None, 0, or 1"),
-        (None, "scalar", 'accumulator must be either "vector" or "matrix"'),
+        (2, "persistent", "resident_operand must be None, 0, or 1"),
+        (
+            None,
+            "scalar",
+            'accumulator must be either "transient" or "persistent"',
+        ),
     ],
 )
 def test_amd_scheduled_mfma_rejects_invalid_roles(resident, accumulator, message):

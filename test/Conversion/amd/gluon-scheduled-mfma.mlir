@@ -21,7 +21,7 @@ module attributes {
     %b = arith.constant dense<2.000000e+00> : tensor<32x16xbf16, #rhs>
     %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
     %result = amdg.scheduled_mfma %a, %b, %acc
-        resident "rhs" accumulator "vector" initialize true
+        resident "rhs" accumulator "transient" initialize true
         : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
           tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
     %committed, %preserved = amdg.mfma_commit %result, %b
@@ -44,11 +44,11 @@ module attributes {
     %b = arith.constant dense<2.000000e+00> : tensor<32x16xbf16, #rhs>
     %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
     %result0 = amdg.scheduled_mfma %a, %b, %acc
-        resident "rhs" accumulator "vector" initialize true
+        resident "rhs" accumulator "transient" initialize true
         : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
           tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
     %result1 = amdg.scheduled_mfma %a, %b, %acc
-        resident "rhs" accumulator "vector" initialize true
+        resident "rhs" accumulator "transient" initialize true
         : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
           tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
     %committed0, %committed1, %preserved =
@@ -67,7 +67,7 @@ module attributes {
     %b = arith.constant dense<2.000000e+00> : tensor<32x16xbf16, #rhs>
     %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
     %result = amdg.scheduled_mfma %a, %b, %acc
-        resident "none" accumulator "matrix" initialize false
+        resident "none" accumulator "persistent" initialize false
         : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
           tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
     tt.return
@@ -85,7 +85,7 @@ module attributes {
     %b = arith.constant dense<2.000000e+00> : tensor<32x16xbf16, #rhs>
     %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
     %result = amdg.scheduled_mfma %a, %b, %acc
-        resident "lhs" accumulator "matrix" initialize false
+        resident "lhs" accumulator "persistent" initialize false
         : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
           tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
     tt.return

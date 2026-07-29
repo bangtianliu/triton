@@ -47,7 +47,7 @@ def commit_mfma(value, preserve, _semantic=None):
     """Commit one or more native vector MFMA results and thread a resident operand.
 
     ``value`` may be one tensor or a tuple of independent native fragments.
-    Each fragment must be a direct vector-storage ``scheduled_mfma`` result.
+    Each fragment must be a direct transient ``scheduled_mfma`` result.
     A single value returns ``(value, preserve)``; a tuple is flattened to
     ``(*values, preserve)`` because Gluon builtins return flat SSA tuples.
     ``preserve`` has no numerical role in ``value``; consume its returned copy
@@ -75,7 +75,7 @@ def commit_mfma(value, preserve, _semantic=None):
 
 
 @builtin
-def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="matrix", initialize=False, _semantic=None):
+def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="persistent", initialize=False, _semantic=None):
     """Update independent native fragments with source-controlled scheduling.
 
     The per-wave fragments of ``a`` and ``b`` form a Cartesian product over
@@ -83,10 +83,11 @@ def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="matrix", initi
     chain; instructions are emitted in N-major, M-minor, K-reduction order.
 
     ``resident_operand`` may be 0 or 1 when one input is intentionally carried
-    through a software pipeline. ``accumulator`` selects ``"vector"`` for a
-    transient result or ``"matrix"`` for a persistent matrix accumulator.
-    These are storage roles, not physical register numbers or tuple widths;
-    lowering derives native tuples from the Gluon layouts.
+    through a software pipeline. ``accumulator`` selects ``"transient"`` for
+    a phase-local result or ``"persistent"`` for an accumulator carried across
+    phases. These are lifetime roles, not storage classes, physical register
+    numbers, or tuple widths; lowering chooses target storage and derives
+    native tuples from the Gluon layouts.
 
     When ``initialize=True``, ``acc`` defines only result shape and layout and
     the native accumulators start from zero. Use ``commit_mfma`` after the
@@ -108,7 +109,10 @@ def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="matrix", initi
         (isinstance(resident_operand, int) and not isinstance(resident_operand, bool) and resident_operand in {0, 1}),
         lambda: "resident_operand must be None, 0, or 1",
     )
-    _check(accumulator in {"vector", "matrix"}, lambda: 'accumulator must be either "vector" or "matrix"')
+    _check(
+        accumulator in {"transient", "persistent"},
+        lambda: 'accumulator must be either "transient" or "persistent"',
+    )
     _check(isinstance(initialize, bool), lambda: "initialize must be a constexpr bool")
     resident_role = {
         None: "none",

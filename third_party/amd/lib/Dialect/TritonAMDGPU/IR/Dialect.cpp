@@ -869,10 +869,10 @@ LogicalResult MfmaCommitOp::verify() {
         return emitOpError() << "input " << index
                              << " must use a unit-tile CDNA4 MFMA layout";
       auto producer = input.getDefiningOp<ScheduledMfmaOp>();
-      if (!producer || producer.getAccumulatorStorage() != "vector")
+      if (!producer || producer.getAccumulatorRole() != "transient")
         return emitOpError()
                << "input " << index
-               << " must be a direct vector-storage scheduled_mfma result";
+               << " must be a direct transient scheduled_mfma result";
       if (!input.hasOneUse())
         return emitOpError()
                << "input " << index
@@ -912,7 +912,7 @@ LogicalResult MfmaCommitOp::verify() {
            << " must be an F32 MFMA result or BF16 dot-operand dependency";
   }
   if (!hasVectorResult)
-    return emitOpError("requires at least one vector-storage MFMA result");
+    return emitOpError("requires at least one transient MFMA result");
   if (!hasLiveDependency)
     return emitOpError("requires at least one live dot-operand dependency");
   return success();
@@ -979,9 +979,10 @@ LogicalResult ScheduledMfmaOp::verify() {
       getResidentOperand() != "rhs")
     return emitOpError(
         "resident_operand must be \"none\", \"lhs\", or \"rhs\"");
-  if (getAccumulatorStorage() != "vector" &&
-      getAccumulatorStorage() != "matrix")
-    return emitOpError("accumulator_storage must be \"vector\" or \"matrix\"");
+  if (getAccumulatorRole() != "transient" &&
+      getAccumulatorRole() != "persistent")
+    return emitOpError(
+        "accumulator_role must be \"transient\" or \"persistent\"");
 
   return success();
 }

@@ -16,10 +16,10 @@ module attributes {
     %b = arith.constant dense<2.000000e+00> : tensor<32x16xbf16, #rhs>
     %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
     %matrix = amdg.scheduled_mfma %a, %b, %acc
-        resident "none" accumulator "matrix" initialize false
+        resident "none" accumulator "persistent" initialize false
         : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
           tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
-    // expected-error@+1 {{input 0 must be a direct vector-storage scheduled_mfma result}}
+    // expected-error@+1 {{input 0 must be a direct transient scheduled_mfma result}}
     %result, %preserved = amdg.mfma_commit %matrix, %b
         : tensor<16x16xf32, #mma>, tensor<32x16xbf16, #rhs>
     tt.return
@@ -30,12 +30,12 @@ module attributes {
     %b = arith.constant dense<2.000000e+00> : tensor<32x16xbf16, #rhs>
     %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
     %vector = amdg.scheduled_mfma %a, %b, %acc
-        resident "rhs" accumulator "vector" initialize true
+        resident "rhs" accumulator "transient" initialize true
         : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
           tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
     %converted = ttg.convert_layout %vector
         : tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma_other>
-    // expected-error@+1 {{input 0 must be a direct vector-storage scheduled_mfma result}}
+    // expected-error@+1 {{input 0 must be a direct transient scheduled_mfma result}}
     %result, %preserved = amdg.mfma_commit %converted, %b
         : tensor<16x16xf32, #mma_other>, tensor<32x16xbf16, #rhs>
     tt.return
@@ -46,7 +46,7 @@ module attributes {
     %b = arith.constant dense<2.000000e+00> : tensor<32x16xbf16, #rhs>
     %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
     %vector = amdg.scheduled_mfma %a, %b, %acc
-        resident "rhs" accumulator "vector" initialize true
+        resident "rhs" accumulator "transient" initialize true
         : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
           tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
     %used = arith.addf %vector, %vector

@@ -972,7 +972,7 @@ public:
     StringRef aStorage = op.getResidentOperand() == "lhs" ? "agpr" : "vgpr";
     StringRef bStorage = op.getResidentOperand() == "rhs" ? "agpr" : "vgpr";
     StringRef accumulatorRegisterClass =
-        op.getAccumulatorStorage() == "matrix" ? "agpr" : "vgpr";
+        op.getAccumulatorRole() == "persistent" ? "agpr" : "vgpr";
     StringRef outputConstraint =
         accumulatorRegisterClass == "agpr" ? "=a" : "=&v";
     auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
