@@ -1193,25 +1193,23 @@ void init_gluon_ir(py::module_ &m) {
                                self.getBuilder().getStringAttr(policy));
            })
       .def("create_mfma_commit",
-           [](GluonOpBuilder &self, Type resultType, Value source,
-              Value preserve) -> Value {
-             return self.create<ttag::MfmaCommitOp>(resultType, source,
-                                                    preserve);
+           [](GluonOpBuilder &self,
+              std::vector<Value> &inputs) -> std::vector<Value> {
+             auto op = self.create<ttag::MfmaCommitOp>(inputs);
+             return {op.getOutputs().begin(), op.getOutputs().end()};
            })
       .def("create_scheduled_mfma",
            [](GluonOpBuilder &self, Type resultType, Value a, Value b,
               Value acc, const std::string &residentOperand,
-              const std::string &accumulatorStorage, bool initialize,
-              bool commit) -> Value {
+              const std::string &accumulatorStorage, bool initialize) -> Value {
              auto residentOperandAttr =
                  self.getBuilder().getStringAttr(residentOperand);
              auto accumulatorStorageAttr =
                  self.getBuilder().getStringAttr(accumulatorStorage);
              auto initializeAttr = self.getBuilder().getBoolAttr(initialize);
-             auto commitAttr = self.getBuilder().getBoolAttr(commit);
              return self.create<ttag::ScheduledMfmaOp>(
                  resultType, a, b, acc, residentOperandAttr,
-                 accumulatorStorageAttr, initializeAttr, commitAttr);
+                 accumulatorStorageAttr, initializeAttr);
            })
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Type resultTy, Value &base,

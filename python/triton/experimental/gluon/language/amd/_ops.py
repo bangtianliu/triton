@@ -44,27 +44,38 @@ def rematerialized_range(start, end, layout, _semantic=None):
 
 @builtin
 def commit_mfma(value, preserve, _semantic=None):
-    """Commit a vector MFMA result while preserving a resident operand.
+    """Commit one or more native vector MFMA results and thread a resident operand.
 
-    ``preserve`` is a real SSA liveness dependency: it has no numerical role
-    in ``value``, but remains resident across the transient MFMA result because
-    a later source operation consumes it. CDNA4 lowering derives native
-    fragment widths and the result-hazard delay from the operand layouts.
+    ``value`` may be one tensor or a tuple of independent native fragments.
+    Each fragment must be a direct vector-storage ``scheduled_mfma`` result.
+    A single value returns ``(value, preserve)``; a tuple is flattened to
+    ``(*values, preserve)`` because Gluon builtins return flat SSA tuples.
+    ``preserve`` has no numerical role in ``value``; consume its returned copy
+    in the next source stage so residency and ordering across the completion
+    boundary are explicit SSA dependencies. CDNA4 lowering derives native
+    fragment widths and the result-hazard delay from operand layouts.
     """
+    single_value = isinstance(value, ttgl.tensor)
+    values = (value,) if single_value else value
     _check(
-        isinstance(value, ttgl.tensor) and isinstance(preserve, ttgl.tensor),
-        lambda: "value and preserve must be distributed tensors")
-    handle = _semantic.builder.create_mfma_commit(
-        value.type.to_ir(_semantic.builder),
-        value.handle,
-        preserve.handle,
+        isinstance(values, (tuple, ttgl.tuple)) and len(values) > 0
+        and all(isinstance(item, ttgl.tensor) for item in values)
+        and isinstance(preserve, ttgl.tensor),
+        lambda: "value must be a tensor or nonempty tensor tuple and preserve must be a tensor")
+    inputs = tuple(values) + (preserve,)
+    handles = _semantic.builder.create_mfma_commit(
+        [item.handle for item in inputs]
     )
-    return ttgl.tensor(handle, value.type)
+    outputs = tuple(
+        ttgl.tensor(handle, item.type) for handle, item in zip(handles, inputs)
+    )
+    if single_value:
+        return outputs[0], outputs[-1]
+    return outputs
 
 
 @builtin
-def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="matrix", initialize=False, commit=False,
-                   _semantic=None):
+def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="matrix", initialize=False, _semantic=None):
     """Update independent native fragments with source-controlled scheduling.
 
     The per-wave fragments of ``a`` and ``b`` form a Cartesian product over
@@ -78,8 +89,9 @@ def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="matrix", initi
     lowering derives native tuples from the Gluon layouts.
 
     When ``initialize=True``, ``acc`` defines only result shape and layout and
-    the native accumulators start from zero. ``commit=True`` requests the
-    architecture-defined MFMA result hazard before the result is consumed.
+    the native accumulators start from zero. Use ``commit_mfma`` after the
+    final independent fragments to express their completion and live-through
+    dependencies.
 
     All active lanes of a wave must execute the operation uniformly. The
     pinned MLIR ``LLVM::InlineAsmOp`` has no convergent-call attribute, so this
@@ -89,7 +101,6 @@ def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="matrix", initi
     resident_operand = _unwrap_if_constexpr(resident_operand)
     accumulator = _unwrap_if_constexpr(accumulator)
     initialize = _unwrap_if_constexpr(initialize)
-    commit = _unwrap_if_constexpr(commit)
     _check(isinstance(a, ttgl.tensor) and isinstance(b, ttgl.tensor), lambda: "a and b must be distributed tensors")
     _check(isinstance(acc, ttgl.tensor), lambda: "acc must be a distributed tensor")
     _check(
@@ -99,7 +110,6 @@ def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="matrix", initi
     )
     _check(accumulator in {"vector", "matrix"}, lambda: 'accumulator must be either "vector" or "matrix"')
     _check(isinstance(initialize, bool), lambda: "initialize must be a constexpr bool")
-    _check(isinstance(commit, bool), lambda: "commit must be a constexpr bool")
     resident_role = {
         None: "none",
         0: "lhs",
@@ -113,7 +123,6 @@ def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="matrix", initi
         resident_role,
         accumulator,
         initialize,
-        commit,
     )
     return ttgl.tensor(handle, acc.type)
 

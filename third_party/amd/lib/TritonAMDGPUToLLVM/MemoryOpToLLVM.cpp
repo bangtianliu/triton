@@ -765,13 +765,6 @@ public:
     auto loc = op.getLoc();
     auto *ctx = rewriter.getContext();
     auto typeConverter = getTypeConverter();
-    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
-    auto preserveTy = cast<RankedTensorType>(op.getPreserve().getType());
-    auto srcMfma = cast<triton::gpu::AMDMfmaEncodingAttr>(srcTy.getEncoding());
-    auto preserveDot =
-        cast<triton::gpu::DotOperandEncodingAttr>(preserveTy.getEncoding());
-    auto preserveMfma =
-        cast<triton::gpu::AMDMfmaEncodingAttr>(preserveDot.getParent());
     TritonLLVMOpBuilder b(loc, rewriter);
 
     auto packGroups =
@@ -801,45 +794,63 @@ public:
       return groups;
     };
 
-    Type srcElementVectorTy;
-    Type srcRegisterVectorTy;
-    Type preserveElementVectorTy;
-    Type preserveRegisterVectorTy;
-    constexpr unsigned warpSize = 64;
-    ArrayRef<unsigned> srcInstr = srcMfma.getInstrShape();
-    unsigned srcRegistersPerFragment = srcInstr[0] * srcInstr[1] / warpSize;
-    ArrayRef<unsigned> preserveInstr = preserveMfma.getInstrShape();
-    unsigned preserveElementsPerFragment =
-        preserveDot.getOpIdx() == 0
-            ? preserveInstr[0] * preserveInstr[2] / warpSize
-            : preserveInstr[2] * preserveInstr[1] / warpSize;
-    unsigned preserveRegistersPerFragment =
-        preserveElementsPerFragment *
-        getIntOrFloatOrPtrBitWidth(
-            typeConverter->convertType(preserveTy.getElementType())) /
-        32;
-    FailureOr<SmallVector<Value>> maybeSrcGroups =
-        packGroups(adaptor.getSrc(), srcTy, srcRegistersPerFragment,
-                   srcElementVectorTy, srcRegisterVectorTy);
-    FailureOr<SmallVector<Value>> maybePreserveGroups = packGroups(
-        adaptor.getPreserve(), preserveTy, preserveRegistersPerFragment,
-        preserveElementVectorTy, preserveRegisterVectorTy);
-    if (failed(maybeSrcGroups) || failed(maybePreserveGroups))
-      return rewriter.notifyMatchFailure(
-          op, "native MFMA fragments do not divide the operands");
-    SmallVector<Value> &srcGroups = *maybeSrcGroups;
-    SmallVector<Value> &preserveGroups = *maybePreserveGroups;
-
+    SmallVector<Type> elementVectorTypes;
+    SmallVector<SmallVector<Value>> inputGroups;
+    SmallVector<size_t> firstGroupIndices;
+    SmallVector<Value> operands;
+    SmallVector<Type> outputTypes;
     std::string constraints;
-    for (size_t index = 0; index < srcGroups.size(); ++index) {
-      if (!constraints.empty())
-        constraints += ",";
-      constraints += "=v";
+    constexpr unsigned warpSize = 64;
+    for (auto [source, converted] :
+         llvm::zip(op.getInputs(), adaptor.getInputs())) {
+      auto tensorTy = cast<RankedTensorType>(source.getType());
+      Type elementVectorTy;
+      Type registerVectorTy;
+      unsigned registersPerGroup = 0;
+      StringRef outputConstraint;
+
+      if (tensorTy.getElementType().isF32()) {
+        auto mfma =
+            cast<triton::gpu::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
+        ArrayRef<unsigned> instr = mfma.getInstrShape();
+        registersPerGroup = instr[0] * instr[1] / warpSize;
+        outputConstraint = "=v";
+      } else {
+        auto dot =
+            cast<triton::gpu::DotOperandEncodingAttr>(tensorTy.getEncoding());
+        auto mfma = cast<triton::gpu::AMDMfmaEncodingAttr>(dot.getParent());
+        ArrayRef<unsigned> instr = mfma.getInstrShape();
+        unsigned elementsPerFragment = dot.getOpIdx() == 0
+                                           ? instr[0] * instr[2] / warpSize
+                                           : instr[2] * instr[1] / warpSize;
+        registersPerGroup =
+            elementsPerFragment *
+            getIntOrFloatOrPtrBitWidth(
+                typeConverter->convertType(tensorTy.getElementType())) /
+            32;
+        outputConstraint = "=a";
+      }
+
+      FailureOr<SmallVector<Value>> maybeGroups =
+          packGroups(converted, tensorTy, registersPerGroup, elementVectorTy,
+                     registerVectorTy);
+      if (failed(maybeGroups))
+        return rewriter.notifyMatchFailure(
+            op, "native fragments do not divide an input");
+
+      elementVectorTypes.push_back(elementVectorTy);
+      firstGroupIndices.push_back(operands.size());
+      inputGroups.push_back(std::move(*maybeGroups));
+      for (Value group : inputGroups.back()) {
+        if (!constraints.empty())
+          constraints += ",";
+        constraints += outputConstraint;
+        operands.push_back(group);
+        outputTypes.push_back(registerVectorTy);
+      }
     }
-    for (size_t index = 0; index < srcGroups.size(); ++index)
+    for (size_t index = 0; index < outputTypes.size(); ++index)
       constraints += "," + std::to_string(index);
-    for (size_t index = 0; index < preserveGroups.size(); ++index)
-      constraints += ",a";
     constraints += ",~{memory}";
 
     // CDNA4 requires six wait states between the final MFMA write and the
@@ -847,12 +858,9 @@ public:
     // lowering rather than exposing an encoded s_nop count in Gluon source.
     constexpr StringLiteral waitAsm = "s_nop 5";
 
-    SmallVector<Value> operands(srcGroups);
-    llvm::append_range(operands, preserveGroups);
-    Type resultTy = srcRegisterVectorTy;
-    if (srcGroups.size() != 1)
-      resultTy = LLVM::LLVMStructType::getLiteral(
-          ctx, SmallVector<Type>(srcGroups.size(), srcRegisterVectorTy));
+    Type resultTy = outputTypes.front();
+    if (outputTypes.size() != 1)
+      resultTy = LLVM::LLVMStructType::getLiteral(ctx, outputTypes);
     auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
     auto operandAttrs = ArrayAttr::get(ctx, {});
     Value constrained =
@@ -863,20 +871,28 @@ public:
             operandAttrs)
             .getRes();
 
-    SmallVector<Value> constrainedElements;
-    for (size_t group = 0; group < srcGroups.size(); ++group) {
-      Value registerGroup = srcGroups.size() == 1
-                                ? constrained
-                                : b.extract_val(constrained, group);
-      Value elementGroup = b.bitcast(registerGroup, srcElementVectorTy);
-      auto elementVectorTy = cast<VectorType>(srcElementVectorTy);
-      for (int64_t index = 0; index < elementVectorTy.getNumElements(); ++index)
-        constrainedElements.push_back(
-            b.extract_element(elementGroup, b.i32_val(index)));
+    auto getConstrainedGroup = [&](size_t index) {
+      return outputTypes.size() == 1 ? constrained
+                                     : b.extract_val(constrained, index);
+    };
+
+    SmallVector<Value> results;
+    for (size_t inputIndex = 0; inputIndex < inputGroups.size(); ++inputIndex) {
+      SmallVector<Value> elements;
+      Type elementVectorTy = elementVectorTypes[inputIndex];
+      auto vectorTy = cast<VectorType>(elementVectorTy);
+      for (size_t group = 0; group < inputGroups[inputIndex].size(); ++group) {
+        Value registerGroup =
+            getConstrainedGroup(firstGroupIndices[inputIndex] + group);
+        Value elementGroup = b.bitcast(registerGroup, elementVectorTy);
+        for (int64_t index = 0; index < vectorTy.getNumElements(); ++index)
+          elements.push_back(b.extract_element(elementGroup, b.i32_val(index)));
+      }
+      results.push_back(packTensorElements(
+          loc, typeConverter, elements, rewriter,
+          cast<RankedTensorType>(op.getOutputs()[inputIndex].getType())));
     }
-    Value result = packTensorElements(loc, typeConverter, constrainedElements,
-                                      rewriter, op.getResult().getType());
-    rewriter.replaceOp(op, result);
+    rewriter.replaceOp(op, results);
     return success();
   }
 };
@@ -1003,36 +1019,6 @@ public:
         }
         updatedFragments[accumulatorIndex] = current;
       }
-    }
-
-    if (op.getCommit()) {
-      std::string constraints;
-      StringRef fenceOutputConstraint =
-          accumulatorRegisterClass == "agpr" ? "=a" : "=v";
-      for (size_t index = 0; index < updatedFragments.size(); ++index) {
-        if (!constraints.empty())
-          constraints += ",";
-        constraints += fenceOutputConstraint;
-      }
-      for (size_t index = 0; index < updatedFragments.size(); ++index)
-        constraints += "," + std::to_string(index);
-      constraints += ",~{memory}";
-
-      Type resultTy = fragmentTy;
-      if (updatedFragments.size() != 1)
-        resultTy = LLVM::LLVMStructType::getLiteral(
-            ctx, SmallVector<Type>(updatedFragments.size(), fragmentTy));
-      Value delayed = LLVM::InlineAsmOp::create(
-                          rewriter, loc, resultTy, updatedFragments,
-                          /*asm_string=*/"s_nop 5", constraints,
-                          /*has_side_effects=*/true,
-                          /*is_align_stack=*/false, LLVM::TailCallKind::None,
-                          asmDialect, operandAttrs)
-                          .getRes();
-      for (size_t index = 0; index < updatedFragments.size(); ++index)
-        updatedFragments[index] = updatedFragments.size() == 1
-                                      ? delayed
-                                      : b.extract_val(delayed, index);
     }
 
     for (int64_t m = 0; m < numRepM; ++m) {

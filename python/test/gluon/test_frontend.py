@@ -3756,7 +3756,7 @@ def scheduled_mfma_kernel():
     a = ttgl.full([16, 32], 1.0, ttgl.bfloat16, a_layout)
     b = ttgl.full([32, 16], 1.0, ttgl.bfloat16, b_layout)
     acc = ttgl.zeros([16, 16], ttgl.float32, mfma_layout)
-    result = ttgl.amd.cdna4.scheduled_mfma(
+    result0 = ttgl.amd.cdna4.scheduled_mfma(
         a,
         b,
         acc,
@@ -3764,7 +3764,17 @@ def scheduled_mfma_kernel():
         accumulator="vector",
         initialize=True,
     )
-    ttgl.amd.cdna4.commit_mfma(result, preserve=b)
+    result1 = ttgl.amd.cdna4.scheduled_mfma(
+        a,
+        b,
+        acc,
+        resident_operand=1,
+        accumulator="vector",
+        initialize=True,
+    )
+    result0, result1, b = ttgl.amd.cdna4.commit_mfma(
+        (result0, result1), preserve=b
+    )
 
 
 def test_amd_scheduled_mfma():
@@ -3778,6 +3788,33 @@ def test_amd_scheduled_mfma():
     assert "amdg.mfma_commit" in text
     assert "registers_per_group" not in text
     assert "post_wait_states" not in text
+
+
+@gluon.jit
+def invalid_matrix_mfma_commit_kernel():
+    mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 1],
+    )
+    a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
+    b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
+    a = ttgl.full([16, 32], 1.0, ttgl.bfloat16, a_layout)
+    b = ttgl.full([32, 16], 1.0, ttgl.bfloat16, b_layout)
+    acc = ttgl.zeros([16, 16], ttgl.float32, mfma_layout)
+    result = ttgl.amd.cdna4.scheduled_mfma(a, b, acc, accumulator="matrix")
+    ttgl.amd.cdna4.commit_mfma(result, preserve=b)
+
+
+def test_amd_mfma_commit_rejects_matrix_source(capfd):
+    with pytest.raises(RuntimeError, match="error encountered during parsing"):
+        run_parser(
+            invalid_matrix_mfma_commit_kernel,
+            *make_args(num_warps=1),
+            target=HIP_TARGET_CDNA4,
+        )
+    assert "must be a direct vector-storage scheduled_mfma result" in capfd.readouterr().err
 
 
 @gluon.jit

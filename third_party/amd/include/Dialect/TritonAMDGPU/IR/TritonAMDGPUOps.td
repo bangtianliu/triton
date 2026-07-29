@@ -721,26 +721,30 @@ def RematerializedRangeOp : TT_AMDGPU_Op<"rematerialized_range"> {
 // MfmaCommitOp
 //===----------------------------------------------------------------------===//
 
-def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit"> {
-  let summary = "Commit a vector MFMA result and preserve a resident operand";
+def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit", [
+    DeclareOpInterfaceMethods<InferTypeOpInterface>,
+    AllTypesMatch<["inputs", "outputs"]>]> {
+  let summary = "Commit native vector MFMA fragments with live dependencies";
   let description = [{
-    Returns `src` unchanged after applying the architecture-defined MFMA result
-    hazard. `preserve` is a non-numerical SSA dependency that remains resident
-    because a later source operation consumes it. The distributed MFMA and dot
-    layouts determine native fragment widths; the source does not provide
-    physical register classes, tuple sizes, or wait-state counts.
+    Returns every input unchanged after applying the architecture-defined MFMA
+    result hazard. One or more inputs must be direct vector-storage
+    `scheduled_mfma` results. Additional dot operands are non-numerical live
+    dependencies, and their corresponding outputs must be consumed by the
+    following source stage. Multiple independent native results can therefore
+    share one completion boundary without first assembling a logical tensor.
+
+    Distributed MFMA and dot layouts determine storage roles and native
+    fragment widths. Source code does not provide physical register classes,
+    tuple sizes, or wait-state counts.
 
     The operation is intentionally side-effecting so the completion and
     liveness boundary cannot be deleted or moved across memory operations.
   }];
 
-  let arguments = (ins TT_Tensor:$src, TT_Tensor:$preserve);
-  let results = (outs TT_Tensor:$result);
+  let arguments = (ins Variadic<TT_Tensor>:$inputs);
+  let results = (outs Variadic<TT_Tensor>:$outputs);
 
-  let assemblyFormat = [{
-    $src `preserve` $preserve attr-dict
-    `:` type($src) `,` type($preserve) `->` type($result)
-  }];
+  let assemblyFormat = "$inputs attr-dict `:` type($inputs)";
 
   let hasVerifier = 1;
 }
@@ -762,10 +766,12 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     intentionally carried through the surrounding software pipeline.
     `accumulator_storage`
     is `vector` for a transient result or `matrix` for a persistent matrix
-    accumulator. `initialize` starts the native accumulators from zero, while
-    `commit` requests the architecture-defined result hazard. These scheduling
-    roles are reusable across kernels; native tuple widths and wait states are
-    derived by lowering rather than exposed in source.
+    accumulator. `initialize` starts the native accumulators from zero.
+    Completion of transient result fragments is represented separately by
+    `mfma_commit`, which can cover multiple independent chains and live
+    dependencies with one boundary. These scheduling roles are reusable across
+    kernels; native tuple widths are derived by lowering rather than exposed in
+    source.
 
     All active lanes of a wave must execute this operation uniformly.  This is
     an explicit source contract because the pinned MLIR `LLVM::InlineAsmOp`
@@ -778,14 +784,13 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
 
   let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,
       StrAttr:$resident_operand, StrAttr:$accumulator_storage,
-      BoolAttr:$initialize, BoolAttr:$commit);
+      BoolAttr:$initialize);
   let results = (outs TT_Tensor:$result);
 
   let assemblyFormat = [{
     $a `,` $b `,` $acc `resident` $resident_operand
     `accumulator` $accumulator_storage `initialize` $initialize
-    `commit` $commit attr-dict
-    `:` type($a) `,` type($b) `,` type($acc) `->` type($result)
+    attr-dict `:` type($a) `,` type($b) `,` type($acc) `->` type($result)
   }];
 
   let hasVerifier = 1;

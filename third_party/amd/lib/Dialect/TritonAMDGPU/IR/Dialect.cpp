@@ -843,48 +843,78 @@ LogicalResult RematerializedRangeOp::verify() {
   return success();
 }
 
+LogicalResult MfmaCommitOp::inferReturnTypes(
+    MLIRContext *context, std::optional<Location> location, ValueRange operands,
+    DictionaryAttr attributes, PropertyRef properties, RegionRange regions,
+    SmallVectorImpl<Type> &inferredReturnTypes) {
+  for (Value operand : operands)
+    inferredReturnTypes.push_back(operand.getType());
+  return success();
+}
+
 LogicalResult MfmaCommitOp::verify() {
   namespace ttg = mlir::triton::gpu;
 
-  if (getResult().getType() != getSrc().getType())
-    return emitOpError("result type must exactly match src");
-
-  auto srcTy = getSrc().getType();
-  auto preserveTy = getPreserve().getType();
-  if (srcTy.getRank() != 2 || !srcTy.getElementType().isF32())
-    return emitOpError("src must be a rank-two F32 MFMA tensor");
-  auto srcMfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(srcTy.getEncoding());
-  if (!srcMfma || srcMfma.getVersion() != 4 || !srcMfma.hasUnitTilesPerWarp())
-    return emitOpError("src must use a unit-tile CDNA4 MFMA layout");
-
-  if (preserveTy.getRank() != 2 || !preserveTy.getElementType().isBF16())
-    return emitOpError("preserve must be a rank-two BF16 dot operand");
-  auto preserveDot =
-      dyn_cast<ttg::DotOperandEncodingAttr>(preserveTy.getEncoding());
-  auto preserveMfma =
-      preserveDot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(preserveDot.getParent())
-                  : ttg::AMDMfmaEncodingAttr();
-  if (!preserveDot || !preserveMfma || preserveMfma.getVersion() != 4 ||
-      preserveDot.getKWidth() != 8)
-    return emitOpError(
-        "preserve must use a CDNA4 BF16 dot-operand layout with kWidth=8");
-
   constexpr int64_t warpSize = 64;
-  ArrayRef<unsigned> srcInstr = srcMfma.getInstrShape();
-  int64_t srcElementsPerFragment = srcInstr[0] * srcInstr[1] / warpSize;
-  if (ttg::getTotalElemsPerThread(srcTy) % srcElementsPerFragment != 0)
-    return emitOpError(
-        "src ownership must be divisible into native MFMA result fragments");
+  bool hasVectorResult = false;
+  bool hasLiveDependency = false;
+  for (auto [index, input] : llvm::enumerate(getInputs())) {
+    auto tensorTy = cast<RankedTensorType>(input.getType());
+    if (tensorTy.getRank() != 2)
+      return emitOpError() << "input " << index << " must be rank two";
 
-  ArrayRef<unsigned> preserveInstr = preserveMfma.getInstrShape();
-  int64_t preserveElementsPerFragment =
-      preserveDot.getOpIdx() == 0
-          ? preserveInstr[0] * preserveInstr[2] / warpSize
-          : preserveInstr[2] * preserveInstr[1] / warpSize;
-  if (ttg::getTotalElemsPerThread(preserveTy) % preserveElementsPerFragment !=
-      0)
-    return emitOpError(
-        "preserve ownership must be divisible into native dot fragments");
+    if (tensorTy.getElementType().isF32()) {
+      auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(tensorTy.getEncoding());
+      if (!mfma || mfma.getVersion() != 4 || !mfma.hasUnitTilesPerWarp())
+        return emitOpError() << "input " << index
+                             << " must use a unit-tile CDNA4 MFMA layout";
+      auto producer = input.getDefiningOp<ScheduledMfmaOp>();
+      if (!producer || producer.getAccumulatorStorage() != "vector")
+        return emitOpError()
+               << "input " << index
+               << " must be a direct vector-storage scheduled_mfma result";
+      if (!input.hasOneUse())
+        return emitOpError()
+               << "input " << index
+               << " must be consumed only by this completion boundary";
+      ArrayRef<unsigned> instr = mfma.getInstrShape();
+      int64_t elementsPerFragment = instr[0] * instr[1] / warpSize;
+      if (ttg::getTotalElemsPerThread(tensorTy) % elementsPerFragment != 0)
+        return emitOpError()
+               << "input " << index
+               << " ownership must divide into native MFMA result fragments";
+      hasVectorResult = true;
+      continue;
+    }
+
+    if (tensorTy.getElementType().isBF16()) {
+      auto dot = dyn_cast<ttg::DotOperandEncodingAttr>(tensorTy.getEncoding());
+      auto mfma = dot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(dot.getParent())
+                      : ttg::AMDMfmaEncodingAttr();
+      if (!dot || !mfma || mfma.getVersion() != 4 || dot.getKWidth() != 8)
+        return emitOpError()
+               << "input " << index
+               << " must use a CDNA4 BF16 dot-operand layout with kWidth=8";
+      ArrayRef<unsigned> instr = mfma.getInstrShape();
+      int64_t elementsPerFragment = dot.getOpIdx() == 0
+                                        ? instr[0] * instr[2] / warpSize
+                                        : instr[2] * instr[1] / warpSize;
+      if (ttg::getTotalElemsPerThread(tensorTy) % elementsPerFragment != 0)
+        return emitOpError()
+               << "input " << index
+               << " ownership must divide into native dot fragments";
+      hasLiveDependency = true;
+      continue;
+    }
+
+    return emitOpError()
+           << "input " << index
+           << " must be an F32 MFMA result or BF16 dot-operand dependency";
+  }
+  if (!hasVectorResult)
+    return emitOpError("requires at least one vector-storage MFMA result");
+  if (!hasLiveDependency)
+    return emitOpError("requires at least one live dot-operand dependency");
   return success();
 }
 
