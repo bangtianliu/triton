@@ -4,9 +4,118 @@ from triton import knobs
 from triton.experimental.gluon.language import _core as ttgl
 from triton.experimental.gluon.language._semantic import _check
 
-from .._core import _unwrap_if_constexpr
+from .._core import builtin, _unwrap_if_constexpr
 from .._layouts import DotOperandLayout
 from ._layouts import AMDWMMALayout
+
+
+@builtin
+def optimize_register_pressure(_semantic=None):
+    """Request the low-spill register-pressure policy for this kernel.
+
+    This is a semantic optimization request rather than the name of a
+    particular LLVM pass. The AMD backend remains free to implement it using
+    the target's scheduling and rematerialization mechanisms.
+    """
+    _semantic.builder.set_register_pressure_policy("minimize-spills")
+
+
+@builtin
+def rematerialized_range(start, end, layout, _semantic=None):
+    """Place a distributed integer range at this source location.
+
+    This has the same values and type as ``gl.arange(start, end, layout)``.
+    It tells the backend that recomputing lane/warp coordinates here is
+    preferable to carrying the range through a long software pipeline. It
+    does not prescribe physical registers or alter numerical semantics.
+    """
+    start = _unwrap_if_constexpr(start)
+    end = _unwrap_if_constexpr(end)
+    layout = _unwrap_if_constexpr(layout)
+    _check(isinstance(start, int) and not isinstance(start, bool), lambda: "start must be a constexpr integer")
+    _check(
+        isinstance(end, int) and not isinstance(end, bool) and end > start,
+        lambda: "end must be a constexpr integer greater than start")
+    _check(layout is not None, lambda: "layout must be explicit")
+    result_type = ttgl.distributed_type(ttgl.int32, [end - start], layout)
+    handle = _semantic.builder.create_rematerialized_range(result_type.to_ir(_semantic.builder), start, end)
+    return ttgl.tensor(handle, result_type)
+
+
+@builtin
+def commit_mfma(value, preserve, _semantic=None):
+    """Commit a vector MFMA result while preserving a resident operand.
+
+    ``preserve`` is a real SSA liveness dependency: it has no numerical role
+    in ``value``, but remains resident across the transient MFMA result because
+    a later source operation consumes it. CDNA4 lowering derives native
+    fragment widths and the result-hazard delay from the operand layouts.
+    """
+    _check(
+        isinstance(value, ttgl.tensor) and isinstance(preserve, ttgl.tensor),
+        lambda: "value and preserve must be distributed tensors")
+    handle = _semantic.builder.create_mfma_commit(
+        value.type.to_ir(_semantic.builder),
+        value.handle,
+        preserve.handle,
+    )
+    return ttgl.tensor(handle, value.type)
+
+
+@builtin
+def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="matrix", initialize=False, commit=False,
+                   _semantic=None):
+    """Update independent native fragments with source-controlled scheduling.
+
+    The per-wave fragments of ``a`` and ``b`` form a Cartesian product over
+    the output grid. Each output fragment remains an independent accumulator
+    chain; instructions are emitted in N-major, M-minor, K-reduction order.
+
+    ``resident_operand`` may be 0 or 1 when one input is intentionally carried
+    through a software pipeline. ``accumulator`` selects ``"vector"`` for a
+    transient result or ``"matrix"`` for a persistent matrix accumulator.
+    These are storage roles, not physical register numbers or tuple widths;
+    lowering derives native tuples from the Gluon layouts.
+
+    When ``initialize=True``, ``acc`` defines only result shape and layout and
+    the native accumulators start from zero. ``commit=True`` requests the
+    architecture-defined MFMA result hazard before the result is consumed.
+
+    All active lanes of a wave must execute the operation uniformly. The
+    pinned MLIR ``LLVM::InlineAsmOp`` has no convergent-call attribute, so this
+    precondition is part of the primitive contract until lowering can use an
+    explicitly convergent target operation.
+    """
+    resident_operand = _unwrap_if_constexpr(resident_operand)
+    accumulator = _unwrap_if_constexpr(accumulator)
+    initialize = _unwrap_if_constexpr(initialize)
+    commit = _unwrap_if_constexpr(commit)
+    _check(isinstance(a, ttgl.tensor) and isinstance(b, ttgl.tensor), lambda: "a and b must be distributed tensors")
+    _check(isinstance(acc, ttgl.tensor), lambda: "acc must be a distributed tensor")
+    _check(
+        resident_operand is None or
+        (isinstance(resident_operand, int) and not isinstance(resident_operand, bool) and resident_operand in {0, 1}),
+        lambda: "resident_operand must be None, 0, or 1",
+    )
+    _check(accumulator in {"vector", "matrix"}, lambda: 'accumulator must be either "vector" or "matrix"')
+    _check(isinstance(initialize, bool), lambda: "initialize must be a constexpr bool")
+    _check(isinstance(commit, bool), lambda: "commit must be a constexpr bool")
+    resident_role = {
+        None: "none",
+        0: "lhs",
+        1: "rhs",
+    }[resident_operand]
+    handle = _semantic.builder.create_scheduled_mfma(
+        acc.type.to_ir(_semantic.builder),
+        a.handle,
+        b.handle,
+        acc.handle,
+        resident_role,
+        accumulator,
+        initialize,
+        commit,
+    )
+    return ttgl.tensor(handle, acc.type)
 
 
 def _wrap_scaled_upcast_result(handle, elem_type, semantic):

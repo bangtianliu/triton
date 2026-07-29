@@ -268,6 +268,22 @@ LogicalResult verifyScaledUpcastFp4ScaleLayout(ScaledUpcastFp4Op op) {
   return success();
 }
 
+LogicalResult verifyBufferContiguity(Operation *op, RankedTensorType tensorTy,
+                                     int64_t contiguity) {
+  if (contiguity <= 0 || (contiguity & (contiguity - 1)) != 0)
+    return op->emitError("contiguity must be a positive power-of-two integer");
+
+  if (!isa<triton::gpu::DistributedEncodingTrait>(tensorTy.getEncoding()))
+    return success();
+
+  int64_t elementsPerThread = triton::gpu::getTotalElemsPerThread(tensorTy);
+  if (contiguity > elementsPerThread || elementsPerThread % contiguity != 0)
+    return op->emitError() << "contiguity " << contiguity << " must divide the "
+                           << elementsPerThread
+                           << " elements owned by each thread";
+  return success();
+}
+
 } // namespace
 
 // Derive the layout of a scale tensor from the upcast output layout. A compact
@@ -743,6 +759,18 @@ LogicalResult BufferLoadToLocalOp::verify() {
   return emitError() << "BufferLoadToLocal unsupported on target architecture";
 }
 
+LogicalResult BufferLoadOp::verify() {
+  return verifyBufferContiguity(getOperation(),
+                                cast<RankedTensorType>(getOffsets().getType()),
+                                getContiguity());
+}
+
+LogicalResult BufferAtomicRMWOp::verify() {
+  return verifyBufferContiguity(getOperation(),
+                                cast<RankedTensorType>(getOffsets().getType()),
+                                getContiguity());
+}
+
 LogicalResult LocalLoadPackedTransposedOp::verify() {
   auto srcTy = getSrc().getType();
   auto dstTy = getType();
@@ -794,6 +822,136 @@ LogicalResult LocalLoadPackedTransposedOp::verify() {
       return emitOpError(
           "Input and output dimensions don't match after packing changes");
   }
+
+  return success();
+}
+
+LogicalResult RematerializedRangeOp::verify() {
+  auto tensorTy = getResult().getType();
+  if (tensorTy.getRank() != 1 || !tensorTy.getElementType().isInteger(32))
+    return emitOpError("requires a rank-one i32 tensor result");
+
+  int64_t start = getStart();
+  int64_t end = getEnd();
+  if (end <= start)
+    return emitOpError("requires end to be greater than start");
+  if (tensorTy.getShape()[0] != end - start)
+    return emitOpError() << "result extent must equal end - start ("
+                         << end - start << ")";
+  if (!tensorTy.getEncoding())
+    return emitOpError("requires a distributed result layout");
+  return success();
+}
+
+LogicalResult MfmaCommitOp::verify() {
+  namespace ttg = mlir::triton::gpu;
+
+  if (getResult().getType() != getSrc().getType())
+    return emitOpError("result type must exactly match src");
+
+  auto srcTy = getSrc().getType();
+  auto preserveTy = getPreserve().getType();
+  if (srcTy.getRank() != 2 || !srcTy.getElementType().isF32())
+    return emitOpError("src must be a rank-two F32 MFMA tensor");
+  auto srcMfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(srcTy.getEncoding());
+  if (!srcMfma || srcMfma.getVersion() != 4 || !srcMfma.hasUnitTilesPerWarp())
+    return emitOpError("src must use a unit-tile CDNA4 MFMA layout");
+
+  if (preserveTy.getRank() != 2 || !preserveTy.getElementType().isBF16())
+    return emitOpError("preserve must be a rank-two BF16 dot operand");
+  auto preserveDot =
+      dyn_cast<ttg::DotOperandEncodingAttr>(preserveTy.getEncoding());
+  auto preserveMfma =
+      preserveDot ? dyn_cast<ttg::AMDMfmaEncodingAttr>(preserveDot.getParent())
+                  : ttg::AMDMfmaEncodingAttr();
+  if (!preserveDot || !preserveMfma || preserveMfma.getVersion() != 4 ||
+      preserveDot.getKWidth() != 8)
+    return emitOpError(
+        "preserve must use a CDNA4 BF16 dot-operand layout with kWidth=8");
+
+  constexpr int64_t warpSize = 64;
+  ArrayRef<unsigned> srcInstr = srcMfma.getInstrShape();
+  int64_t srcElementsPerFragment = srcInstr[0] * srcInstr[1] / warpSize;
+  if (ttg::getTotalElemsPerThread(srcTy) % srcElementsPerFragment != 0)
+    return emitOpError(
+        "src ownership must be divisible into native MFMA result fragments");
+
+  ArrayRef<unsigned> preserveInstr = preserveMfma.getInstrShape();
+  int64_t preserveElementsPerFragment =
+      preserveDot.getOpIdx() == 0
+          ? preserveInstr[0] * preserveInstr[2] / warpSize
+          : preserveInstr[2] * preserveInstr[1] / warpSize;
+  if (ttg::getTotalElemsPerThread(preserveTy) % preserveElementsPerFragment !=
+      0)
+    return emitOpError(
+        "preserve ownership must be divisible into native dot fragments");
+  return success();
+}
+
+LogicalResult ScheduledMfmaOp::verify() {
+  namespace ttg = mlir::triton::gpu;
+
+  auto aTy = getA().getType();
+  auto bTy = getB().getType();
+  auto accTy = getAcc().getType();
+  auto resultTy = getResult().getType();
+  if (aTy.getRank() != 2 || bTy.getRank() != 2 || accTy.getRank() != 2)
+    return emitOpError("requires rank-2 operands and accumulator");
+  if (!aTy.getElementType().isBF16() || !bTy.getElementType().isBF16() ||
+      !accTy.getElementType().isF32())
+    return emitOpError("requires BF16 operands and an F32 accumulator");
+  if (resultTy != accTy)
+    return emitOpError("result type must exactly match the accumulator type");
+  if (aTy.getShape()[0] != accTy.getShape()[0] ||
+      bTy.getShape()[1] != accTy.getShape()[1] ||
+      aTy.getShape()[1] != bTy.getShape()[0])
+    return emitOpError(
+        "operand and accumulator matrix shapes are inconsistent");
+
+  auto mfma = dyn_cast<ttg::AMDMfmaEncodingAttr>(accTy.getEncoding());
+  if (!mfma || mfma.getVersion() != 4 || !mfma.hasUnitTilesPerWarp() ||
+      mfma.getElementBitWidth() != 32)
+    return emitOpError(
+        "requires a CDNA4 F32 MFMA accumulator with unit tiles per wave");
+  ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+  if (instrShape != ArrayRef<unsigned>({32, 32, 16}) &&
+      instrShape != ArrayRef<unsigned>({16, 16, 32}))
+    return emitOpError(
+        "supports only native 32x32x16 and 16x16x32 MFMA shapes");
+
+  auto aDot = dyn_cast<ttg::DotOperandEncodingAttr>(aTy.getEncoding());
+  auto bDot = dyn_cast<ttg::DotOperandEncodingAttr>(bTy.getEncoding());
+  if (!aDot || aDot.getOpIdx() != 0 || aDot.getKWidth() != 8 ||
+      aDot.getParent() != mfma)
+    return emitOpError(
+        "operand A must use the matching opIdx=0, kWidth=8 dot layout");
+  if (!bDot || bDot.getOpIdx() != 1 || bDot.getKWidth() != 8 ||
+      bDot.getParent() != mfma)
+    return emitOpError(
+        "operand B must use the matching opIdx=1, kWidth=8 dot layout");
+
+  SmallVector<int64_t> aRep =
+      mfma.getRepForOperand(aTy.getShape(), aDot.getKWidth(), 0);
+  SmallVector<int64_t> bRep =
+      mfma.getRepForOperand(bTy.getShape(), bDot.getKWidth(), 1);
+  if (aRep[0] != 1 || bRep[0] != 1 || aRep[2] <= 0 || aRep[2] != bRep[1])
+    return emitOpError(
+        "requires one batch and matching nonempty K fragments per wave");
+
+  constexpr int64_t warpSize = 64;
+  int64_t elementsPerFragment = instrShape[0] * instrShape[1] / warpSize;
+  int64_t expectedElements = aRep[1] * bRep[2] * elementsPerFragment;
+  if (ttg::getTotalElemsPerThread(accTy) != expectedElements)
+    return emitOpError(
+        "accumulator ownership does not match the native MFMA grid");
+
+  if (getResidentOperand() != "none" && getResidentOperand() != "lhs" &&
+      getResidentOperand() != "rhs")
+    return emitOpError(
+        "resident_operand must be \"none\", \"lhs\", or \"rhs\"");
+  if (getAccumulatorStorage() != "vector" &&
+      getAccumulatorStorage() != "matrix")
+    return emitOpError("accumulator_storage must be \"vector\" or \"matrix\"");
 
   return success();
 }

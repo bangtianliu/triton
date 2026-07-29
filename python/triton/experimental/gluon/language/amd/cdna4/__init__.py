@@ -7,7 +7,14 @@ from triton._C.libtriton.gluon_ir import (
 from ..._core import builtin, int8, uint8, _unwrap_if_constexpr
 from ..._layouts import DotOperandLayout
 from .._layouts import AMDMFMALayout
-from .._ops import _mma_scaled, _scaled_upcast
+from .._ops import (
+    commit_mfma,
+    _mma_scaled,
+    _scaled_upcast,
+    optimize_register_pressure,
+    rematerialized_range,
+    scheduled_mfma,
+)
 from ..cdna3 import _buffer_atomic_rmw_impl, _convert_e8m0_scale_to_bf16
 from ..cdna3 import *  # NOQA: F403
 from ..cdna3 import __all__ as __cdna3_all
@@ -20,6 +27,10 @@ __all__ = [
     "scaled_upcast",
     "get_mfma_scale_layout",
     "compute_efficient_padded_shared_layout",
+    "commit_mfma",
+    "optimize_register_pressure",
+    "rematerialized_range",
+    "scheduled_mfma",
 ]
 
 
@@ -170,48 +181,48 @@ The cdna4 version additionally supports `fadd` with `bf16`.
 
 
 @builtin
-def buffer_atomic_max(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_max(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
     return _buffer_atomic_rmw_impl('max', ptr, offsets, value, "cdna4", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_min(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_min(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('min', ptr, offsets, value, "cdna4", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_add(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_add(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('add', ptr, offsets, value, "cdna4", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_and(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_and(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('and', ptr, offsets, value, "cdna4", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_or(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_or(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('or', ptr, offsets, value, "cdna4", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_xor(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_xor(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('xor', ptr, offsets, value, "cdna4", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_xchg(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_xchg(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('xchg', ptr, offsets, value, "cdna4", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)

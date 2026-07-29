@@ -12,6 +12,9 @@ import functools
 import warnings
 from pathlib import Path
 
+REGISTER_PRESSURE_POLICY_ATTR = "ttg.amdg.register-pressure-policy"
+MINIMIZE_SPILLS_POLICY = "minimize-spills"
+
 
 def get_min_dot_size(target: GPUTarget):
     # We fallback to use FMA and cast arguments if certain configurations is
@@ -351,6 +354,15 @@ class HIPBackend(BaseBackend):
     @staticmethod
     def make_llir(src, metadata, options):
         mod = src
+        kernel = mod.get_function(mod.get_entry_func_name())
+        register_pressure_policy = (kernel.get_operation().get_str_attr(REGISTER_PRESSURE_POLICY_ATTR) or "none")
+        if register_pressure_policy not in {
+                "none",
+                MINIMIZE_SPILLS_POLICY,
+        }:
+            raise ValueError(f"unsupported AMD register pressure policy: "
+                             f"{register_pressure_policy}")
+        metadata["register_pressure_policy"] = register_pressure_policy
         # TritonGPU -> LLVM-IR (MLIR)
         pm = ir.pass_manager(mod.context)
         pm.enable_debug()
@@ -547,6 +559,8 @@ class HIPBackend(BaseBackend):
         flags = []
         if is_expert_scheduling_enabled(options.arch):
             flags.append("amdgpu-expert-scheduling-mode")
+        if (metadata.get("register_pressure_policy", "none") == MINIMIZE_SPILLS_POLICY):
+            flags.append("sink-insts-to-avoid-spills")
         features = disable_real_true16_feature(options.arch)
         ir_hash = hashlib.sha256(src.encode("utf-8")).hexdigest()
         dump_file_id = names[0] + '_' + ir_hash

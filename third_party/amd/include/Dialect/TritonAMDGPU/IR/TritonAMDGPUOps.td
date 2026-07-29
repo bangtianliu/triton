@@ -300,6 +300,8 @@ def BufferLoadOp : TT_AMDGPU_Op<"buffer_load", [
     );
     let results = (outs TT_Tensor:$result);
 
+    let hasVerifier = 1;
+
     let assemblyFormat = [{
       $ptr `[` $offsets `]` (`,` $mask^)? (`,` $other^)?
       oilist(`cacheModifier` `=` $cache)
@@ -381,18 +383,19 @@ def BufferAtomicRMWOp : TT_AMDGPU_Op<"buffer_atomic_rmw", [
         Stride is the distance between the beginning of contiguous memory chunks. When performing a RMW, the `stride` is
         the address difference between the first elements of each row in bytes. Compiler tries to obtain the `stride`
         when it converts to the buffer ops because it is important for optimizing the cache memory access.
+        Contiguity is the maximum number of elements that can be processed by one vector atomic with the given layout
+        and mask. This preserves alignment information proven while converting the original pointer-based atomic.
     }];
-    let arguments = (ins
-      TT_AtomicRMWAttr:$atomic_rmw_op,
-      Arg<TT_Ptr, "Global memory pointer", [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
-      I32Tensor:$offsets,
-      TT_Tensor:$value,
-      Optional<I32>:$stride,
-      TT_MemSemanticAttr:$sem,
-      TT_MemSyncScopeAttr:$scope,
-      Optional<TT_BoolTensor>:$mask
-    );
+    let arguments = (ins TT_AtomicRMWAttr:$atomic_rmw_op,
+        Arg<TT_Ptr, "Global memory pointer",
+            [MemRead<GlobalMemory>, MemWrite<GlobalMemory>]>:$ptr,
+        I32Tensor:$offsets, TT_Tensor:$value, Optional<I32>:$stride,
+        TT_MemSemanticAttr:$sem, TT_MemSyncScopeAttr:$scope,
+        Optional<TT_BoolTensor>:$mask,
+        DefaultValuedAttr<I32Attr, "1">:$contiguity);
     let results = (outs TT_Tensor:$result);
+
+    let hasVerifier = 1;
 
     let assemblyFormat = [{
         $atomic_rmw_op `,` $sem `,` $scope `,` $value `,` $ptr `[` $offsets `]` (`,` $mask^)?
@@ -684,6 +687,107 @@ def LocalLoadPackedTransposedOp : TT_AMDGPU_Op<"local_load_packed_tranposed", [L
 
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
   let assemblyFormat = [{$src (`token` $token^)? attr-dict `:` qualified(type($src)) `->` type($result)}];
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// RematerializedRangeOp
+//===----------------------------------------------------------------------===//
+
+def RematerializedRangeOp : TT_AMDGPU_Op<"rematerialized_range"> {
+  let summary = "Prefer rematerializing a distributed range at this point";
+  let description = [{
+    Produces the same logical values as a rank-one `tt.make_range`, but records
+    that recomputing the lane/warp coordinates at this source point is
+    preferable to carrying them through a long software pipeline.
+
+    The operation is intentionally not `Pure`, so source instances are not
+    merged by the Gluon/TTGIR CSE pipeline.  Target lowering may realize the
+    placement using its normal register-pressure policy.  The operation neither
+    names physical registers nor changes numerical results.
+  }];
+
+  let arguments = (ins I32Attr:$start, I32Attr:$end);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $start `to` $end attr-dict `:` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// MfmaCommitOp
+//===----------------------------------------------------------------------===//
+
+def MfmaCommitOp : TT_AMDGPU_Op<"mfma_commit"> {
+  let summary = "Commit a vector MFMA result and preserve a resident operand";
+  let description = [{
+    Returns `src` unchanged after applying the architecture-defined MFMA result
+    hazard. `preserve` is a non-numerical SSA dependency that remains resident
+    because a later source operation consumes it. The distributed MFMA and dot
+    layouts determine native fragment widths; the source does not provide
+    physical register classes, tuple sizes, or wait-state counts.
+
+    The operation is intentionally side-effecting so the completion and
+    liveness boundary cannot be deleted or moved across memory operations.
+  }];
+
+  let arguments = (ins TT_Tensor:$src, TT_Tensor:$preserve);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $src `preserve` $preserve attr-dict
+    `:` type($src) `,` type($preserve) `->` type($result)
+  }];
+
+  let hasVerifier = 1;
+}
+
+//===----------------------------------------------------------------------===//
+// ScheduledMfmaOp
+//===----------------------------------------------------------------------===//
+
+def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
+  let summary = "Execute source-scheduled independent native MFMA fragments";
+  let description = [{
+    Computes the full per-wave Cartesian product of the native fragments in
+    `a` and `b`, replacing every corresponding fragment in `acc`.  Native
+    instructions are emitted in N-major, M-minor, K-reduction order, so each
+    output fragment remains an independent dependency chain while consecutive
+    native K fragments stay on that chain.
+
+    `resident_operand` is `none`, `lhs`, or `rhs` and identifies an input
+    intentionally carried through the surrounding software pipeline.
+    `accumulator_storage`
+    is `vector` for a transient result or `matrix` for a persistent matrix
+    accumulator. `initialize` starts the native accumulators from zero, while
+    `commit` requests the architecture-defined result hazard. These scheduling
+    roles are reusable across kernels; native tuple widths and wait states are
+    derived by lowering rather than exposed in source.
+
+    All active lanes of a wave must execute this operation uniformly.  This is
+    an explicit source contract because the pinned MLIR `LLVM::InlineAsmOp`
+    cannot represent a convergent call attribute.
+
+    The initial contract supports CDNA4 BF16 inputs, F32 accumulators, one or
+    more K fragments per wave, and native 32x32x16 or 16x16x32 instruction
+    shapes.
+  }];
+
+  let arguments = (ins TT_Tensor:$a, TT_Tensor:$b, TT_Tensor:$acc,
+      StrAttr:$resident_operand, StrAttr:$accumulator_storage,
+      BoolAttr:$initialize, BoolAttr:$commit);
+  let results = (outs TT_Tensor:$result);
+
+  let assemblyFormat = [{
+    $a `,` $b `,` $acc `resident` $resident_operand
+    `accumulator` $accumulator_storage `initialize` $initialize
+    `commit` $commit attr-dict
+    `:` type($a) `,` type($b) `,` type($acc) `->` type($result)
+  }];
+
   let hasVerifier = 1;
 }
 

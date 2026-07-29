@@ -21,6 +21,7 @@
 #include "triton/Analysis/Utility.h"
 #include "triton/Dialect/Gluon/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "triton/Dialect/Triton/IR/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
 #include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
@@ -1121,10 +1122,11 @@ void init_gluon_ir(py::module_ &m) {
            })
       .def("create_buffer_load",
            [](GluonOpBuilder &self, Type resultType, Value ptr, Value offsets,
-              Value mask, Value other, tt::CacheModifier cache) -> Value {
+              Value mask, Value other, tt::CacheModifier cache,
+              uint32_t contiguity) -> Value {
              return self.create<ttag::BufferLoadOp>(resultType, ptr, offsets,
                                                     Value() /*stride*/, cache,
-                                                    mask, other);
+                                                    mask, other, contiguity);
            })
       .def("create_buffer_store",
            [](GluonOpBuilder &self, Value storedValue, Value ptr, Value offsets,
@@ -1135,10 +1137,10 @@ void init_gluon_ir(py::module_ &m) {
       .def("create_buffer_atomic_rmw",
            [](GluonOpBuilder &self, tt::RMWOp op, Value ptr, Value offsets,
               Value value, tt::MemSemantic sem, tt::MemSyncScope scope,
-              Value mask) -> Value {
+              Value mask, uint32_t contiguity) -> Value {
              return self.create<ttag::BufferAtomicRMWOp>(
                  value.getType(), op, ptr, offsets, value, Value() /*stride*/,
-                 sem, scope, mask);
+                 sem, scope, mask, contiguity);
            })
       .def("create_buffer_load_to_local",
            [](GluonOpBuilder &self, Value dest, Value ptr, Value offsets,
@@ -1165,6 +1167,51 @@ void init_gluon_ir(py::module_ &m) {
              auto offsetsAttr = self.getBuilder().getDenseI64ArrayAttr(offsets);
              return self.create<ttag::ExtractSliceOp>(resultType, source,
                                                       offsetsAttr);
+           })
+      .def("create_rematerialized_range",
+           [](GluonOpBuilder &self, Type resultType, int32_t start,
+              int32_t end) -> Value {
+             auto startAttr = self.getBuilder().getI32IntegerAttr(start);
+             auto endAttr = self.getBuilder().getI32IntegerAttr(end);
+             return self.create<ttag::RematerializedRangeOp>(
+                 resultType, startAttr, endAttr);
+           })
+      .def("set_register_pressure_policy",
+           [](GluonOpBuilder &self, const std::string &policy) {
+             Operation *parent =
+                 self.getBuilder().getInsertionBlock()->getParentOp();
+             triton::FuncOp function = dyn_cast<triton::FuncOp>(parent);
+             if (!function)
+               function = parent->getParentOfType<triton::FuncOp>();
+             if (!function)
+               throw std::runtime_error(
+                   "register pressure policy requires a Triton function");
+             if (!triton::isKernel(function))
+               throw std::runtime_error(
+                   "register pressure policy must be set on a kernel entry");
+             function->setAttr("ttg.amdg.register-pressure-policy",
+                               self.getBuilder().getStringAttr(policy));
+           })
+      .def("create_mfma_commit",
+           [](GluonOpBuilder &self, Type resultType, Value source,
+              Value preserve) -> Value {
+             return self.create<ttag::MfmaCommitOp>(resultType, source,
+                                                    preserve);
+           })
+      .def("create_scheduled_mfma",
+           [](GluonOpBuilder &self, Type resultType, Value a, Value b,
+              Value acc, const std::string &residentOperand,
+              const std::string &accumulatorStorage, bool initialize,
+              bool commit) -> Value {
+             auto residentOperandAttr =
+                 self.getBuilder().getStringAttr(residentOperand);
+             auto accumulatorStorageAttr =
+                 self.getBuilder().getStringAttr(accumulatorStorage);
+             auto initializeAttr = self.getBuilder().getBoolAttr(initialize);
+             auto commitAttr = self.getBuilder().getBoolAttr(commit);
+             return self.create<ttag::ScheduledMfmaOp>(
+                 resultType, a, b, acc, residentOperandAttr,
+                 accumulatorStorageAttr, initializeAttr, commitAttr);
            })
       .def("create_make_tensor_descriptor",
            [](TritonOpBuilder &self, Type resultTy, Value &base,

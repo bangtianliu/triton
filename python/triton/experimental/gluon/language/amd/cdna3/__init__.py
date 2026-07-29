@@ -71,8 +71,13 @@ def _verify_element_type_and_dispatch_op(op, elem_type, arch):
     raise ValueError(f"Unknown {op} on CDNA3 or CDNA4")
 
 
-def _buffer_atomic_rmw_impl(op, ptr, offsets, value, arch, mask, sem, scope, _semantic):
+def _buffer_atomic_rmw_impl(op, ptr, offsets, value, arch, mask, sem, scope, contiguity, _semantic):
     _verify_buffer_ops(ptr, offsets, mask)
+
+    contiguity = _unwrap_if_constexpr(contiguity)
+    assert isinstance(contiguity, int) and not isinstance(contiguity, bool) and contiguity > 0 \
+        and (contiguity & (contiguity - 1)) == 0, \
+        f"contiguity must be a positive power of two, got {contiguity!r}"
 
     op = _verify_element_type_and_dispatch_op(op, ptr.type.scalar.element_ty, arch)
 
@@ -90,12 +95,12 @@ def _buffer_atomic_rmw_impl(op, ptr, offsets, value, arch, mask, sem, scope, _se
     sem = _semantic._str_to_sem(sem)
     scope = _semantic._str_to_scope(scope)
     return _semantic.tensor(
-        _semantic.builder.create_buffer_atomic_rmw(op, ptr.handle, offsets.handle, value.handle, sem, scope, mask),
-        value.type)
+        _semantic.builder.create_buffer_atomic_rmw(op, ptr.handle, offsets.handle, value.handle, sem, scope, mask,
+                                                   contiguity), value.type)
 
 
 @builtin
-def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None):
+def buffer_load(ptr, offsets, mask=None, other=None, cache=None, contiguity=1, _semantic=None):
     """
     AMD buffer load from global memory via a scalar base pointer and a tensor of
     offsets instead of a tensor of pointers. This operation will load data
@@ -107,8 +112,16 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
         mask (tensor, optional): Mask tensor for predicated loads. Defaults to None.
         other (tensor or scalar, optional): Tensor or scalar providing default values for masked elements. Defaults to None.
         cache_modifier (str): Cache modifier specifier. Defaults to "".
+        contiguity (int, optional): Trusted positive power-of-two lower bound on
+            contiguous elements available for vectorization. It must divide
+            the number of elements owned by each thread. Defaults to 1.
     """
     _verify_buffer_ops(ptr, offsets, mask, other)
+
+    contiguity = _unwrap_if_constexpr(contiguity)
+    assert isinstance(contiguity, int) and not isinstance(contiguity, bool) and contiguity > 0 \
+        and (contiguity & (contiguity - 1)) == 0, \
+        f"contiguity must be a positive power of two, got {contiguity!r}"
 
     mask = _unwrap_if_constexpr(mask)
     if mask is not None:
@@ -127,7 +140,8 @@ def buffer_load(ptr, offsets, mask=None, other=None, cache=None, _semantic=None)
 
     ret_ty = offsets.type.with_element_ty(ptr.type.scalar.element_ty)
     builder = _semantic.builder
-    handle = builder.create_buffer_load(ret_ty.to_ir(builder), ptr.handle, offsets.handle, mask, other, cache_modifier)
+    handle = builder.create_buffer_load(ret_ty.to_ir(builder), ptr.handle, offsets.handle, mask, other, cache_modifier,
+                                        contiguity)
     return ttgl.tensor(handle, ret_ty)
 
 
@@ -233,52 +247,53 @@ Args:
     mask (tensor, optional): Mask tensor for predicated loads. Defaults to None.
     sem (str, optional): Memory Semantic Descriptor. Default is None which means acq_rel memory semantic.
     scope (str, optional): Memory Sync Scope for atomic accesses. Default is None and it will be mapped to `gpu`, which is called `agent` for AMDGPU. Please ref https://llvm.org/docs/AMDGPUUsage.html#memory-model-gfx942 for details.
+    contiguity (int, optional): Trusted positive power-of-two lower bound on contiguous elements available for vectorization. Defaults to 1.
 """
 
 
 @builtin
-def buffer_atomic_max(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_max(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
     return _buffer_atomic_rmw_impl('max', ptr, offsets, value, "cdna3", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_min(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_min(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('min', ptr, offsets, value, "cdna3", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_add(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_add(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('add', ptr, offsets, value, "cdna3", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_and(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_and(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('and', ptr, offsets, value, "cdna3", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_or(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_or(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('or', ptr, offsets, value, "cdna3", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_xor(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_xor(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('xor', ptr, offsets, value, "cdna3", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)
 
 
 @builtin
-def buffer_atomic_xchg(ptr, offsets, value, mask=None, sem=None, scope=None, _semantic=None):
+def buffer_atomic_xchg(ptr, offsets, value, mask=None, sem=None, scope=None, contiguity=1, _semantic=None):
 
     return _buffer_atomic_rmw_impl('xchg', ptr, offsets, value, "cdna3", mask=mask, sem=sem, scope=scope,
-                                   _semantic=_semantic)
+                                   contiguity=contiguity, _semantic=_semantic)

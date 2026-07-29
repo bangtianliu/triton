@@ -1,0 +1,8 @@
+module {
+  tt.func public @register_pressure_policy() attributes {
+    noinline = false,
+    "ttg.amdg.register-pressure-policy" = "minimize-spills"
+  } {
+    tt.return
+  }
+}

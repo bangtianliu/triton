@@ -676,8 +676,13 @@ struct BufferLoadOpConversion
     Type ptrType = getPointerTypeWithShape(ptr, offset);
     unsigned numElems = getTotalElemsPerThread(ptrType);
     unsigned vec = getVectorSize(ptr, offset, axisAnalysisPass);
+    unsigned contiguity = op.getContiguity();
+    if (contiguity > numElems || numElems % contiguity != 0)
+      return rewriter.notifyMatchFailure(
+          op, "contiguity must divide the per-thread element count");
     // If the op has a contiguity hint use it to increase the vector size.
-    vec = std::max(vec, op.getContiguity());
+    unsigned maxVec = 128 / triton::getPointeeBitWidth(ptr.getType());
+    vec = std::max(vec, std::min(contiguity, maxVec));
 
     // Get the offset
     SmallVector<Value> offsetElems =
@@ -1801,13 +1806,24 @@ struct BufferAtomicRMWOpConversion
 
     unsigned numElems = getTotalElemsPerThread(ptrType);
     unsigned vec = getVectorSize(ptr, offset, axisAnalysisPass);
+    unsigned contiguity = op.getContiguity();
+    if (contiguity > numElems || numElems % contiguity != 0)
+      return rewriter.notifyMatchFailure(
+          op, "contiguity must divide the per-thread element count");
+    // ConvertToBufferOps may have proved pointer/mask alignment before
+    // canonicalizing the pointer to a scalar base plus tensor offsets. Keep
+    // that proof, since axis analysis on the canonical offsets can be weaker.
+    vec = std::max(vec, contiguity);
 
     // v4f16 and v4bf16 variants of buffer atomics do not exist.
     // only v2f16 and v2bf16.
     if (valueElemTy.isBF16() || valueElemTy.isF16()) {
       // We clamp to the only supported vectorization width here (2).
       // In ConvertToBufferOps we check that we have a large enough vector size
-      assert(vec >= 2);
+      if (vec < 2)
+        return rewriter.notifyMatchFailure(
+            op, "16-bit buffer atomics require two contiguous elements per "
+                "thread");
       vec = 2u;
       // The max width of a buffer atomic op is 64-bits
       // Some types like F32 don't have a 2x vectorized version
@@ -1825,6 +1841,10 @@ struct BufferAtomicRMWOpConversion
     // Get the mask
     SmallVector<Value> maskElems =
         getMaskElemsAndUpdateVeclen(rewriter, loc, llMask, mask, vec);
+    if ((valueElemTy.isBF16() || valueElemTy.isF16()) && vec != 2)
+      return rewriter.notifyMatchFailure(
+          op, "16-bit buffer atomics require a mask that preserves pairs of "
+              "contiguous elements");
 
     Value rsrcDesc = bufferEmitter.createResourceDescriptor(llPtr, llStride);
     SmallVector<Value> loadedVals;

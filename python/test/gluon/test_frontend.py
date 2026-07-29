@@ -3407,7 +3407,7 @@ def buffer_load_store_kernel(x, y):
     offsets = ttgl.convert_layout(auto_layout_offsets, layout=layout)
     mask = ttgl.full((64, 64), 1, tl.int1, layout=layout)
     other = ttgl.full((64, 64), 1.0, tl.float32, layout=layout)
-    a = ttgl.amd.cdna3.buffer_load(ptr=x, offsets=offsets, mask=mask, other=other, cache='.ca')
+    a = ttgl.amd.cdna3.buffer_load(ptr=x, offsets=offsets, mask=mask, other=other, cache='.ca', contiguity=4)
     ttgl.amd.cdna3.buffer_store(stored_value=a, ptr=y, offsets=offsets, mask=mask, cache='.cs')
 
     a = ttgl.amd.cdna4.buffer_load(ptr=x, offsets=offsets, mask=mask, other=other, cache='.ca')
@@ -3437,7 +3437,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %cst = arith.constant dense<true> : tensor<64x64xi1, #blocked>
     %cst_0 = arith.constant 1.000000e+00 : f32
     %cst_1 = arith.constant dense<1.000000e+00> : tensor<64x64xf32, #blocked>
-    %3 = amdg.buffer_load %arg0[%2], %cst, %cst_1 cacheModifier = ca : tensor<64x64xf32, #blocked>
+    %3 = amdg.buffer_load %arg0[%2], %cst, %cst_1 cacheModifier = ca {contiguity = 4 : i32} : tensor<64x64xf32, #blocked>
     amdg.buffer_store %3, %arg1[%2], %cst cacheModifier = cs : tensor<64x64xf32, #blocked>
     %4 = amdg.buffer_load %arg0[%2], %cst, %cst_1 cacheModifier = ca : tensor<64x64xf32, #blocked>
     amdg.buffer_store %4, %arg1[%2], %cst cacheModifier = cs : tensor<64x64xf32, #blocked>
@@ -3455,6 +3455,69 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 """)
+
+
+@gluon.jit
+def buffer_contiguity_kernel(x):
+    layout: ttgl.constexpr = ttgl.BlockedLayout([4], [64], [4], [0])
+    offsets = ttgl.arange(0, 1024, layout=layout)
+    value = ttgl.amd.cdna3.buffer_load(x, offsets, contiguity=4)
+    ttgl.amd.cdna3.buffer_atomic_add(x, offsets, value, contiguity=2)
+
+
+def test_buffer_contiguity_hints():
+    x = MockTensor(ttgl.float32)
+    module = run_parser(buffer_contiguity_kernel, *make_args(x), target=HIP_TARGET_CDNA3)
+    ir_text = module.str_nodebug()
+
+    assert re.search(r"amdg\.buffer_load .*\{contiguity = 4 : i32\}", ir_text)
+    assert re.search(r"amdg\.buffer_atomic_rmw fadd, .*\{contiguity = 2 : i32\}", ir_text)
+
+
+@pytest.mark.parametrize("operation", ["load", "atomic"])
+@pytest.mark.parametrize("contiguity", [0, 3, True])
+def test_buffer_contiguity_rejects_invalid(operation, contiguity):
+    if operation == "load":
+
+        @gluon.jit
+        def kernel(x, CONTIGUITY: ttgl.constexpr):
+            layout: ttgl.constexpr = ttgl.BlockedLayout([1], [64], [4], [0])
+            offsets = ttgl.arange(0, 256, layout=layout)
+            ttgl.amd.cdna3.buffer_load(x, offsets, contiguity=CONTIGUITY)
+
+    else:
+
+        @gluon.jit
+        def kernel(x, CONTIGUITY: ttgl.constexpr):
+            layout: ttgl.constexpr = ttgl.BlockedLayout([1], [64], [4], [0])
+            offsets = ttgl.arange(0, 256, layout=layout)
+            value = ttgl.zeros([256], ttgl.float32, layout=layout)
+            ttgl.amd.cdna3.buffer_atomic_add(x, offsets, value, contiguity=CONTIGUITY)
+
+    x = MockTensor(ttgl.float32)
+    with pytest.raises(CompilationError) as error:
+        run_parser(kernel, *make_args(x, contiguity), target=HIP_TARGET_CDNA3)
+
+    message = str(error.value.__cause__ or error.value)
+    assert f"contiguity must be a positive power of two, got {contiguity!r}" in message
+
+
+@gluon.jit
+def excessive_buffer_contiguity_kernel(x):
+    layout: ttgl.constexpr = ttgl.BlockedLayout([1], [64], [4], [0])
+    offsets = ttgl.arange(0, 256, layout=layout)
+    ttgl.amd.cdna3.buffer_load(x, offsets, contiguity=2)
+
+
+def test_buffer_contiguity_rejects_more_than_thread_ownership(capfd):
+    x = MockTensor(ttgl.float32)
+    with pytest.raises(RuntimeError, match="error encountered during parsing"):
+        run_parser(
+            excessive_buffer_contiguity_kernel,
+            *make_args(x),
+            target=HIP_TARGET_CDNA3,
+        )
+    assert ("contiguity 2 must divide the 1 elements owned by each thread" in capfd.readouterr().err)
 
 
 @gluon.jit
@@ -3653,6 +3716,101 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
   }
 }
 """)
+
+
+@gluon.jit
+def register_pressure_optimization_kernel():
+    ttgl.amd.cdna4.optimize_register_pressure()
+
+
+def test_amd_register_pressure_policy():
+    module = run_parser(register_pressure_optimization_kernel, target=HIP_TARGET_CDNA4)
+    assert ('"ttg.amdg.register-pressure-policy" = "minimize-spills"' in module.str_nodebug())
+
+
+@gluon.jit
+def rematerialized_range_kernel():
+    range_layout: ttgl.constexpr = ttgl.BlockedLayout([4], [64], [1], [0])
+    ttgl.amd.cdna4.rematerialized_range(0, 256, range_layout)
+
+
+def test_amd_rematerialized_range():
+    module = run_parser(
+        rematerialized_range_kernel,
+        *make_args(num_warps=1),
+        target=HIP_TARGET_CDNA4,
+    )
+    assert "amdg.rematerialized_range" in module.str_nodebug()
+
+
+@gluon.jit
+def scheduled_mfma_kernel():
+    mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 1],
+    )
+    a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
+    b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
+    a = ttgl.full([16, 32], 1.0, ttgl.bfloat16, a_layout)
+    b = ttgl.full([32, 16], 1.0, ttgl.bfloat16, b_layout)
+    acc = ttgl.zeros([16, 16], ttgl.float32, mfma_layout)
+    result = ttgl.amd.cdna4.scheduled_mfma(
+        a,
+        b,
+        acc,
+        resident_operand=1,
+        accumulator="vector",
+        initialize=True,
+    )
+    ttgl.amd.cdna4.commit_mfma(result, preserve=b)
+
+
+def test_amd_scheduled_mfma():
+    module = run_parser(
+        scheduled_mfma_kernel,
+        *make_args(num_warps=1),
+        target=HIP_TARGET_CDNA4,
+    )
+    text = module.str_nodebug()
+    assert "amdg.scheduled_mfma" in text
+    assert "amdg.mfma_commit" in text
+    assert "registers_per_group" not in text
+    assert "post_wait_states" not in text
+
+
+@gluon.jit
+def invalid_scheduled_mfma_kernel(RESIDENT: ttgl.constexpr, ACCUMULATOR: ttgl.constexpr):
+    mfma_layout: ttgl.constexpr = ttgl.amd.AMDMFMALayout(
+        version=4,
+        instr_shape=[16, 16, 32],
+        transposed=True,
+        warps_per_cta=[1, 1],
+    )
+    a_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=0, parent=mfma_layout, k_width=8)
+    b_layout: ttgl.constexpr = ttgl.DotOperandLayout(operand_index=1, parent=mfma_layout, k_width=8)
+    a = ttgl.full([16, 32], 1.0, ttgl.bfloat16, a_layout)
+    b = ttgl.full([32, 16], 1.0, ttgl.bfloat16, b_layout)
+    acc = ttgl.zeros([16, 16], ttgl.float32, mfma_layout)
+    ttgl.amd.cdna4.scheduled_mfma(a, b, acc, resident_operand=RESIDENT, accumulator=ACCUMULATOR)
+
+
+@pytest.mark.parametrize(
+    ("resident", "accumulator", "message"),
+    [
+        (2, "matrix", "resident_operand must be None, 0, or 1"),
+        (None, "scalar", 'accumulator must be either "vector" or "matrix"'),
+    ],
+)
+def test_amd_scheduled_mfma_rejects_invalid_roles(resident, accumulator, message):
+    with pytest.raises(CompilationError) as error:
+        run_parser(
+            invalid_scheduled_mfma_kernel,
+            *make_args(resident, accumulator, num_warps=1),
+            target=HIP_TARGET_CDNA4,
+        )
+    assert message in str(error.value.__cause__ or error.value)
 
 
 @pytest.mark.parametrize("target", [HIP_TARGET_CDNA4])

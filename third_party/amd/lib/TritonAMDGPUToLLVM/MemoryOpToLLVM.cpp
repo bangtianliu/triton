@@ -4,9 +4,11 @@
 #include "PatternTritonGPUOpToLLVM.h"
 #include "mlir/Dialect/LLVMIR/LLVMDialect.h"
 #include "mlir/Dialect/LLVMIR/ROCDLDialect.h"
+#include "mlir/Dialect/Utils/IndexingUtils.h"
 #include "triton/Conversion/TritonGPUToLLVM/Utility.h"
 #include "triton/Dialect/TritonGPU/IR/Attributes.h"
 #include "triton/Dialect/TritonGPU/IR/Dialect.h"
+#include "triton/Dialect/TritonGPU/IR/LinearLayoutConversions.h"
 #include "triton/Dialect/TritonGPU/IR/Types.h"
 #include "triton/Tools/LayoutUtils.h"
 #include "triton/Tools/LinearLayout.h"
@@ -636,6 +638,419 @@ private:
   const AMD::TargetInfo &targetInfo;
 };
 
+static FailureOr<SmallVector<Value>>
+packMfmaDotOperandFragments(Value value, RankedTensorType tensorTy,
+                            unsigned opIdx, ArrayRef<int64_t> expectedRep,
+                            const LLVMTypeConverter *typeConverter,
+                            ConversionPatternRewriter &rewriter, Location loc) {
+  auto dotEncoding =
+      dyn_cast<triton::gpu::DotOperandEncodingAttr>(tensorTy.getEncoding());
+  auto mfmaEncoding =
+      dotEncoding
+          ? dyn_cast<triton::gpu::AMDMfmaEncodingAttr>(dotEncoding.getParent())
+          : triton::gpu::AMDMfmaEncodingAttr();
+  if (!mfmaEncoding || dotEncoding.getOpIdx() != opIdx ||
+      dotEncoding.getKWidth() != 8)
+    return failure();
+
+  SmallVector<int64_t> rep = mfmaEncoding.getRepForOperand(
+      tensorTy.getShape(), dotEncoding.getKWidth(), opIdx);
+  if (rep != expectedRep)
+    return failure();
+
+  constexpr int64_t kBase = 8;
+  const int64_t batch = rep[0];
+  const int64_t nonKRep = rep[opIdx == 0 ? 1 : 2];
+  const int64_t kRep = rep[opIdx == 0 ? 2 : 1];
+  const int64_t numKVec = kRep * dotEncoding.getKWidth() / kBase;
+  if (numKVec <= 0)
+    return failure();
+
+  SmallVector<Value> elems =
+      unpackTensorElements(loc, value, rewriter, tensorTy);
+  SmallVector<int64_t> strides =
+      computeStrides({batch, nonKRep, numKVec, kBase});
+  if (elems.size() != batch * nonKRep * numKVec * kBase)
+    return failure();
+
+  Type elemTy = typeConverter->convertType(tensorTy.getElementType());
+  auto vecTy = vec_ty(elemTy, kBase);
+  TritonLLVMOpBuilder b(loc, rewriter);
+  SmallVector<Value> fragments;
+  for (int64_t batchIdx = 0; batchIdx < batch; ++batchIdx) {
+    for (int64_t nonKIdx = 0; nonKIdx < nonKRep; ++nonKIdx) {
+      for (int64_t kVecIdx = 0; kVecIdx < numKVec; ++kVecIdx) {
+        Value fragment = b.undef(vecTy);
+        for (int64_t k = 0; k < kBase; ++k) {
+          int64_t index = linearize({batchIdx, nonKIdx, kVecIdx, k}, strides);
+          fragment =
+              b.insert_element(vecTy, fragment, elems[index], b.i32_val(k));
+        }
+        fragments.push_back(fragment);
+      }
+    }
+  }
+  return fragments;
+}
+
+class RematerializedRangeOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::RematerializedRangeOp> {
+public:
+  RematerializedRangeOpConversion(const LLVMTypeConverter &converter,
+                                  const AMD::TargetInfo &targetInfo,
+                                  PatternBenefit benefit)
+      : ConvertOpToLLVMPattern<triton::amdgpu::RematerializedRangeOp>(converter,
+                                                                      benefit),
+        targetInfo(targetInfo) {}
+  using OpAdaptor = triton::amdgpu::RematerializedRangeOp::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::RematerializedRangeOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
+    auto tensorTy = cast<RankedTensorType>(op.getResult().getType());
+    TritonLLVMOpBuilder b(loc, rewriter);
+
+    // Materialize from the target's ordinary thread coordinate at this
+    // side-effecting source anchor. The distinct operation instances survive
+    // the Gluon/TTGIR CSE pipeline; the backend's register-pressure policy is
+    // then responsible for keeping the cheap coordinate arithmetic near use.
+    Value threadId = getThreadId(rewriter, loc);
+
+    int threadsPerWarp = triton::gpu::lookupThreadsPerWarp(rewriter);
+    Value laneId = b.urem(threadId, b.i32_val(threadsPerWarp));
+    Value warpId = b.udiv(threadId, b.i32_val(threadsPerWarp));
+    Value blockId = targetInfo.getClusterCTAId(rewriter, loc);
+    LinearLayout layout = triton::gpu::toLinearLayout(tensorTy);
+    StringAttr kRegister = str_attr("register");
+    StringAttr kLane = str_attr("lane");
+    StringAttr kWarp = str_attr("warp");
+    StringAttr kBlock = str_attr("block");
+
+    SmallVector<Value> values;
+    values.reserve(layout.getInDimSize(kRegister));
+    for (unsigned reg = 0; reg < layout.getInDimSize(kRegister); ++reg) {
+      auto indices = applyLinearLayout(loc, rewriter, layout,
+                                       {{kRegister, b.i32_val(reg)},
+                                        {kLane, laneId},
+                                        {kWarp, warpId},
+                                        {kBlock, blockId}});
+      if (indices.size() != 1)
+        return rewriter.notifyMatchFailure(
+            op, "rank-one range layout produced multiple coordinates");
+      values.push_back(b.add(indices.front().second, b.i32_val(op.getStart())));
+    }
+
+    Value result =
+        packTensorElements(loc, getTypeConverter(), values, rewriter, tensorTy);
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+
+private:
+  const AMD::TargetInfo &targetInfo;
+};
+
+class MfmaCommitOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::MfmaCommitOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::amdgpu::MfmaCommitOp>::ConvertOpToLLVMPattern;
+  using OpAdaptor = triton::amdgpu::MfmaCommitOp::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::MfmaCommitOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
+    auto typeConverter = getTypeConverter();
+    auto srcTy = cast<RankedTensorType>(op.getSrc().getType());
+    auto preserveTy = cast<RankedTensorType>(op.getPreserve().getType());
+    auto srcMfma = cast<triton::gpu::AMDMfmaEncodingAttr>(srcTy.getEncoding());
+    auto preserveDot =
+        cast<triton::gpu::DotOperandEncodingAttr>(preserveTy.getEncoding());
+    auto preserveMfma =
+        cast<triton::gpu::AMDMfmaEncodingAttr>(preserveDot.getParent());
+    TritonLLVMOpBuilder b(loc, rewriter);
+
+    auto packGroups =
+        [&](Value value, RankedTensorType tensorTy, unsigned registersPerGroup,
+            Type &elementVectorTy,
+            Type &registerVectorTy) -> FailureOr<SmallVector<Value>> {
+      Type elemTy = typeConverter->convertType(tensorTy.getElementType());
+      unsigned bitWidth = getIntOrFloatOrPtrBitWidth(elemTy);
+      unsigned elementsPerGroup = registersPerGroup * 32 / bitWidth;
+      SmallVector<Value> elements =
+          unpackTensorElements(loc, value, rewriter, tensorTy);
+      if (elements.empty() || elements.size() % elementsPerGroup != 0)
+        return failure();
+
+      elementVectorTy = vec_ty(elemTy, elementsPerGroup);
+      registerVectorTy = vec_ty(i32_ty, registersPerGroup);
+      SmallVector<Value> groups;
+      for (unsigned begin = 0; begin < elements.size();
+           begin += elementsPerGroup) {
+        Value elementVector = b.undef(elementVectorTy);
+        for (unsigned index = 0; index < elementsPerGroup; ++index)
+          elementVector =
+              b.insert_element(elementVectorTy, elementVector,
+                               elements[begin + index], b.i32_val(index));
+        groups.push_back(b.bitcast(elementVector, registerVectorTy));
+      }
+      return groups;
+    };
+
+    Type srcElementVectorTy;
+    Type srcRegisterVectorTy;
+    Type preserveElementVectorTy;
+    Type preserveRegisterVectorTy;
+    constexpr unsigned warpSize = 64;
+    ArrayRef<unsigned> srcInstr = srcMfma.getInstrShape();
+    unsigned srcRegistersPerFragment = srcInstr[0] * srcInstr[1] / warpSize;
+    ArrayRef<unsigned> preserveInstr = preserveMfma.getInstrShape();
+    unsigned preserveElementsPerFragment =
+        preserveDot.getOpIdx() == 0
+            ? preserveInstr[0] * preserveInstr[2] / warpSize
+            : preserveInstr[2] * preserveInstr[1] / warpSize;
+    unsigned preserveRegistersPerFragment =
+        preserveElementsPerFragment *
+        getIntOrFloatOrPtrBitWidth(
+            typeConverter->convertType(preserveTy.getElementType())) /
+        32;
+    FailureOr<SmallVector<Value>> maybeSrcGroups =
+        packGroups(adaptor.getSrc(), srcTy, srcRegistersPerFragment,
+                   srcElementVectorTy, srcRegisterVectorTy);
+    FailureOr<SmallVector<Value>> maybePreserveGroups = packGroups(
+        adaptor.getPreserve(), preserveTy, preserveRegistersPerFragment,
+        preserveElementVectorTy, preserveRegisterVectorTy);
+    if (failed(maybeSrcGroups) || failed(maybePreserveGroups))
+      return rewriter.notifyMatchFailure(
+          op, "native MFMA fragments do not divide the operands");
+    SmallVector<Value> &srcGroups = *maybeSrcGroups;
+    SmallVector<Value> &preserveGroups = *maybePreserveGroups;
+
+    std::string constraints;
+    for (size_t index = 0; index < srcGroups.size(); ++index) {
+      if (!constraints.empty())
+        constraints += ",";
+      constraints += "=v";
+    }
+    for (size_t index = 0; index < srcGroups.size(); ++index)
+      constraints += "," + std::to_string(index);
+    for (size_t index = 0; index < preserveGroups.size(); ++index)
+      constraints += ",a";
+    constraints += ",~{memory}";
+
+    // CDNA4 requires six wait states between the final MFMA write and the
+    // first general vector use of its result. Keep this ISA latency in target
+    // lowering rather than exposing an encoded s_nop count in Gluon source.
+    constexpr StringLiteral waitAsm = "s_nop 5";
+
+    SmallVector<Value> operands(srcGroups);
+    llvm::append_range(operands, preserveGroups);
+    Type resultTy = srcRegisterVectorTy;
+    if (srcGroups.size() != 1)
+      resultTy = LLVM::LLVMStructType::getLiteral(
+          ctx, SmallVector<Type>(srcGroups.size(), srcRegisterVectorTy));
+    auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
+    auto operandAttrs = ArrayAttr::get(ctx, {});
+    Value constrained =
+        LLVM::InlineAsmOp::create(
+            rewriter, loc, resultTy, operands, waitAsm.str(), constraints,
+            /*has_side_effects=*/true,
+            /*is_align_stack=*/false, LLVM::TailCallKind::None, asmDialect,
+            operandAttrs)
+            .getRes();
+
+    SmallVector<Value> constrainedElements;
+    for (size_t group = 0; group < srcGroups.size(); ++group) {
+      Value registerGroup = srcGroups.size() == 1
+                                ? constrained
+                                : b.extract_val(constrained, group);
+      Value elementGroup = b.bitcast(registerGroup, srcElementVectorTy);
+      auto elementVectorTy = cast<VectorType>(srcElementVectorTy);
+      for (int64_t index = 0; index < elementVectorTy.getNumElements(); ++index)
+        constrainedElements.push_back(
+            b.extract_element(elementGroup, b.i32_val(index)));
+    }
+    Value result = packTensorElements(loc, typeConverter, constrainedElements,
+                                      rewriter, op.getResult().getType());
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
+class ScheduledMfmaOpConversion
+    : public ConvertOpToLLVMPattern<triton::amdgpu::ScheduledMfmaOp> {
+public:
+  using ConvertOpToLLVMPattern<
+      triton::amdgpu::ScheduledMfmaOp>::ConvertOpToLLVMPattern;
+  using OpAdaptor = triton::amdgpu::ScheduledMfmaOp::Adaptor;
+
+  LogicalResult
+  matchAndRewrite(triton::amdgpu::ScheduledMfmaOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    auto loc = op.getLoc();
+    auto *ctx = rewriter.getContext();
+    auto typeConverter = getTypeConverter();
+    auto aTy = cast<RankedTensorType>(op.getA().getType());
+    auto bTy = cast<RankedTensorType>(op.getB().getType());
+    auto accTy = cast<RankedTensorType>(op.getAcc().getType());
+    auto mfma = cast<triton::gpu::AMDMfmaEncodingAttr>(accTy.getEncoding());
+    auto aDot = cast<triton::gpu::DotOperandEncodingAttr>(aTy.getEncoding());
+    auto bDot = cast<triton::gpu::DotOperandEncodingAttr>(bTy.getEncoding());
+
+    SmallVector<int64_t> aRep =
+        mfma.getRepForOperand(aTy.getShape(), aDot.getKWidth(), 0);
+    SmallVector<int64_t> bRep =
+        mfma.getRepForOperand(bTy.getShape(), bDot.getKWidth(), 1);
+    FailureOr<SmallVector<Value>> maybeA = packMfmaDotOperandFragments(
+        adaptor.getA(), aTy, /*opIdx=*/0, aRep, typeConverter, rewriter, loc);
+    FailureOr<SmallVector<Value>> maybeB = packMfmaDotOperandFragments(
+        adaptor.getB(), bTy, /*opIdx=*/1, bRep, typeConverter, rewriter, loc);
+    int64_t numRepM = aRep[1];
+    int64_t numRepN = bRep[2];
+    constexpr int64_t kBase = 8;
+    int64_t numRepK = aRep[2] * aDot.getKWidth() / kBase;
+    int64_t numRepKB = bRep[1] * bDot.getKWidth() / kBase;
+    if (failed(maybeA) || failed(maybeB) || numRepK <= 0 ||
+        numRepK != numRepKB ||
+        maybeA->size() != static_cast<size_t>(numRepM * numRepK) ||
+        maybeB->size() != static_cast<size_t>(numRepN * numRepK))
+      return rewriter.notifyMatchFailure(
+          op, "operands do not match the verified native MFMA grid");
+
+    ArrayRef<unsigned> instrShape = mfma.getInstrShape();
+    constexpr int64_t warpSize = 64;
+    int64_t elemsPerFragment = instrShape[0] * instrShape[1] / warpSize;
+    SmallVector<int64_t> strides =
+        computeStrides({1, numRepM, numRepN, elemsPerFragment});
+    SmallVector<Value> elements =
+        unpackTensorElements(loc, adaptor.getAcc(), rewriter, accTy);
+    if (elements.size() !=
+        static_cast<size_t>(numRepM * numRepN * elemsPerFragment))
+      return rewriter.notifyMatchFailure(
+          op, "accumulator element count does not match its MFMA grid");
+
+    Type accElemTy = typeConverter->convertType(accTy.getElementType());
+    auto fragmentTy = vec_ty(accElemTy, elemsPerFragment);
+    TritonLLVMOpBuilder b(loc, rewriter);
+    SmallVector<Value> accumulatorFragments;
+    accumulatorFragments.reserve(numRepM * numRepN);
+    for (int64_t m = 0; m < numRepM; ++m) {
+      for (int64_t n = 0; n < numRepN; ++n) {
+        Value fragment = b.undef(fragmentTy);
+        for (int64_t index = 0; index < elemsPerFragment; ++index) {
+          int64_t linearIndex = linearize({0, m, n, index}, strides);
+          fragment = b.insert_element(fragmentTy, fragment,
+                                      elements[linearIndex], b.i32_val(index));
+        }
+        accumulatorFragments.push_back(fragment);
+      }
+    }
+
+    auto inputConstraint = [](StringRef registerClass) -> StringRef {
+      return registerClass == "agpr" ? "a" : "v";
+    };
+    StringRef aStorage = op.getResidentOperand() == "lhs" ? "agpr" : "vgpr";
+    StringRef bStorage = op.getResidentOperand() == "rhs" ? "agpr" : "vgpr";
+    StringRef accumulatorRegisterClass =
+        op.getAccumulatorStorage() == "matrix" ? "agpr" : "vgpr";
+    StringRef outputConstraint =
+        accumulatorRegisterClass == "agpr" ? "=a" : "=&v";
+    auto asmDialect = LLVM::AsmDialectAttr::get(ctx, LLVM::AsmDialect::AD_ATT);
+    auto operandAttrs = ArrayAttr::get(ctx, {});
+    std::string mfmaAsmPrefix = instrShape == ArrayRef<unsigned>({32, 32, 16})
+                                    ? "v_mfma_f32_32x32x16_bf16 $0, $1, $2, "
+                                    : "v_mfma_f32_16x16x32_bf16 $0, $1, $2, ";
+
+    SmallVector<Value> updatedFragments(numRepM * numRepN);
+    // Keep one SSA chain per output fragment while making source order
+    // explicit across the grid.
+    for (int64_t n = 0; n < numRepN; ++n) {
+      for (int64_t m = 0; m < numRepM; ++m) {
+        int64_t accumulatorIndex = m * numRepN + n;
+        Value current = accumulatorFragments[accumulatorIndex];
+        for (int64_t k = 0; k < numRepK; ++k) {
+          Value operandA = (*maybeA)[m * numRepK + k];
+          Value operandB = (*maybeB)[n * numRepK + k];
+          StringRef aRegisterClass = aStorage;
+          StringRef bRegisterClass = bStorage;
+          if (mfma.getIsTransposed()) {
+            std::swap(operandA, operandB);
+            std::swap(aRegisterClass, bRegisterClass);
+          }
+
+          bool zeroThisInstruction = op.getInitialize() && k == 0;
+          std::string constraints = outputConstraint.str();
+          constraints += "," + inputConstraint(aRegisterClass).str();
+          constraints += "," + inputConstraint(bRegisterClass).str();
+          SmallVector<Value> asmOperands{operandA, operandB};
+          if (!zeroThisInstruction) {
+            asmOperands.push_back(current);
+            constraints += ",0";
+          }
+          std::string mfmaAsm = mfmaAsmPrefix;
+          mfmaAsm += zeroThisInstruction ? "0" : "$0";
+          current = LLVM::InlineAsmOp::create(rewriter, loc, fragmentTy,
+                                              asmOperands, mfmaAsm, constraints,
+                                              /*has_side_effects=*/true,
+                                              /*is_align_stack=*/false,
+                                              LLVM::TailCallKind::None,
+                                              asmDialect, operandAttrs)
+                        .getRes();
+        }
+        updatedFragments[accumulatorIndex] = current;
+      }
+    }
+
+    if (op.getCommit()) {
+      std::string constraints;
+      StringRef fenceOutputConstraint =
+          accumulatorRegisterClass == "agpr" ? "=a" : "=v";
+      for (size_t index = 0; index < updatedFragments.size(); ++index) {
+        if (!constraints.empty())
+          constraints += ",";
+        constraints += fenceOutputConstraint;
+      }
+      for (size_t index = 0; index < updatedFragments.size(); ++index)
+        constraints += "," + std::to_string(index);
+      constraints += ",~{memory}";
+
+      Type resultTy = fragmentTy;
+      if (updatedFragments.size() != 1)
+        resultTy = LLVM::LLVMStructType::getLiteral(
+            ctx, SmallVector<Type>(updatedFragments.size(), fragmentTy));
+      Value delayed = LLVM::InlineAsmOp::create(
+                          rewriter, loc, resultTy, updatedFragments,
+                          /*asm_string=*/"s_nop 5", constraints,
+                          /*has_side_effects=*/true,
+                          /*is_align_stack=*/false, LLVM::TailCallKind::None,
+                          asmDialect, operandAttrs)
+                          .getRes();
+      for (size_t index = 0; index < updatedFragments.size(); ++index)
+        updatedFragments[index] = updatedFragments.size() == 1
+                                      ? delayed
+                                      : b.extract_val(delayed, index);
+    }
+
+    for (int64_t m = 0; m < numRepM; ++m) {
+      for (int64_t n = 0; n < numRepN; ++n) {
+        Value fragment = updatedFragments[m * numRepN + n];
+        for (int64_t index = 0; index < elemsPerFragment; ++index) {
+          int64_t linearIndex = linearize({0, m, n, index}, strides);
+          elements[linearIndex] = b.extract_element(fragment, b.i32_val(index));
+        }
+      }
+    }
+    Value result = packTensorElements(loc, typeConverter, elements, rewriter,
+                                      op.getResult().getType());
+    rewriter.replaceOp(op, result);
+    return success();
+  }
+};
+
 struct LocalAtomicScatterRMWOpConversion
     : public ConvertOpToLLVMPattern<triton::gpu::LocalAtomicScatterRMWOp> {
 
@@ -896,6 +1311,10 @@ void mlir::triton::AMD::populateMemoryOpToLLVMPatterns(
                                            transBenefit);
   patterns.add<LocalLoadPackedTransposedOpConversion>(typeConverter, targetInfo,
                                                       benefit);
+  patterns.add<RematerializedRangeOpConversion>(typeConverter, targetInfo,
+                                                transBenefit);
+  patterns.add<MfmaCommitOpConversion, ScheduledMfmaOpConversion>(typeConverter,
+                                                                  transBenefit);
   patterns.add<LocalAtomicScatterRMWOpConversion>(typeConverter, targetInfo,
                                                   benefit.getBenefit() + 1);
   patterns.add<BarrierOpConversion, MemoryCounterWaitOpConversion>(
