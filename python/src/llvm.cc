@@ -40,6 +40,7 @@
 #include <csignal>
 #include <cstdio>
 #include <memory>
+#include <mutex>
 #include <nanobind/make_iterator.h>
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
@@ -50,6 +51,7 @@
 #include <nanobind/stl/vector.h>
 #include <stdexcept>
 #include <unordered_set>
+#include <vector>
 
 namespace py = nanobind;
 
@@ -65,79 +67,116 @@ using namespace llvm;
 
 namespace {
 
-// Set an LLVM command-line option using addOccurrence (simulates command-line)
-// and return its original value. Using addOccurrence instead of setValue is
-// necessary because some LLVM passes (like schedulers) check whether the option
-// was explicitly set on the command line.
-template <typename T> T setLLVMOption(const std::string &name, T value);
+template <typename T> T getLLVMOptionValue(llvm::cl::Option *option);
 
-template <> bool setLLVMOption<bool>(const std::string &name, bool value) {
-  auto options = llvm::cl::getRegisteredOptions();
-  auto it = options.find(name);
-  if (it == options.end())
-    return false;
-  auto *opt = static_cast<llvm::cl::opt<bool> *>(it->second);
-  bool original = opt->getValue();
-  // Use addOccurrence to mark the option as explicitly set on command line.
-  // This is important for options like enable-misched where LLVM checks
-  // getNumOccurrences() to determine if the option was explicitly set.
-  // See: llvm/lib/CodeGen/MachineScheduler.cpp -
-  // enableMachineSchedDefaultSched() checks
-  // "EnableMachineSched.getNumOccurrences()" to decide behavior.
-  it->second->addOccurrence(1, name, value ? "true" : "false");
-  return original;
+template <> bool getLLVMOptionValue<bool>(llvm::cl::Option *option) {
+  return static_cast<llvm::cl::opt<bool> *>(option)->getValue();
 }
 
 template <>
-std::string setLLVMOption<std::string>(const std::string &name,
-                                       std::string value) {
-  auto options = llvm::cl::getRegisteredOptions();
-  auto it = options.find(name);
-  if (it == options.end())
-    return "";
-  auto *opt = static_cast<llvm::cl::opt<std::string> *>(it->second);
-  std::string original = opt->getValue();
-  it->second->addOccurrence(1, name, value);
-  return original;
+std::string getLLVMOptionValue<std::string>(llvm::cl::Option *option) {
+  return static_cast<llvm::cl::opt<std::string> *>(option)->getValue();
 }
 
-// Restore an LLVM command-line option to a previous value
-template <typename T> void restoreLLVMOption(const std::string &name, T value);
+template <typename T>
+void setLLVMOptionValue(llvm::cl::Option *option, const T &value);
 
-template <> void restoreLLVMOption<bool>(const std::string &name, bool value) {
-  auto options = llvm::cl::getRegisteredOptions();
-  auto it = options.find(name);
-  if (it != options.end()) {
-    auto *opt = static_cast<llvm::cl::opt<bool> *>(it->second);
-    opt->setValue(value);
-  }
+template <>
+void setLLVMOptionValue<bool>(llvm::cl::Option *option, const bool &value) {
+  static_cast<llvm::cl::opt<bool> *>(option)->setValue(value);
 }
 
 template <>
-void restoreLLVMOption<std::string>(const std::string &name,
-                                    std::string value) {
-  auto options = llvm::cl::getRegisteredOptions();
-  auto it = options.find(name);
-  if (it != options.end()) {
-    it->second->addOccurrence(1, name, value);
-  }
+void setLLVMOptionValue<std::string>(llvm::cl::Option *option,
+                                     const std::string &value) {
+  static_cast<llvm::cl::opt<std::string> *>(option)->setValue(value);
 }
 
-// RAII guard that sets an LLVM option and restores it on destruction
+template <typename T> std::string stringifyLLVMOptionValue(const T &value);
+
+template <> std::string stringifyLLVMOptionValue<bool>(const bool &value) {
+  return value ? "true" : "false";
+}
+
+template <>
+std::string stringifyLLVMOptionValue<std::string>(const std::string &value) {
+  return value;
+}
+
+// LLVM command-line options are process-global. Every compilation entry point
+// that can mutate or observe these options takes this lock, including ordinary
+// compilations with no per-kernel flags, so another thread cannot observe a
+// temporary value after nanobind releases the GIL.
+std::mutex &getLLVMOptionMutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+
+// RAII guard that restores both an LLVM option's value and whether/how many
+// times it was explicitly specified. Several codegen decisions inspect
+// getNumOccurrences(), so restoring only the value is insufficient.
 template <typename T> class ScopedLLVMOption {
   std::string name;
-  T originalValue;
+  llvm::cl::Option *option = nullptr;
+  T originalValue{};
+  int originalOccurrences = 0;
+
+  void restore() noexcept {
+    if (!option)
+      return;
+    option->reset();
+    if (originalOccurrences == 0) {
+      setLLVMOptionValue<T>(option, originalValue);
+      return;
+    }
+    const std::string value = stringifyLLVMOptionValue<T>(originalValue);
+    for (int i = 0; i < originalOccurrences; ++i)
+      option->addOccurrence(1, name, value);
+  }
 
 public:
   ScopedLLVMOption(const std::string &n, T newValue) : name(n) {
-    originalValue = setLLVMOption<T>(name, newValue);
+    auto options = llvm::cl::getRegisteredOptions();
+    auto it = options.find(name);
+    if (it == options.end())
+      return;
+    option = it->second;
+    originalValue = getLLVMOptionValue<T>(option);
+    originalOccurrences = option->getNumOccurrences();
+
+    // Start the temporary setting from a clean occurrence count. Otherwise a
+    // second compilation can violate a cl::opt's Optional occurrence policy.
+    option->reset();
+    if (option->addOccurrence(1, name, stringifyLLVMOptionValue<T>(newValue))) {
+      restore();
+      throw std::runtime_error("failed to set LLVM option: " + name);
+    }
   }
-  ~ScopedLLVMOption() { restoreLLVMOption<T>(name, originalValue); }
+  ~ScopedLLVMOption() { restore(); }
 
   // Non-copyable
   ScopedLLVMOption(const ScopedLLVMOption &) = delete;
   ScopedLLVMOption &operator=(const ScopedLLVMOption &) = delete;
 };
+
+std::vector<std::unique_ptr<ScopedLLVMOption<bool>>>
+scopeLLVMFlags(const std::vector<std::string> &flags) {
+  std::vector<std::unique_ptr<ScopedLLVMOption<bool>>> guards;
+  guards.reserve(flags.size());
+  for (const std::string &flag : flags)
+    guards.push_back(std::make_unique<ScopedLLVMOption<bool>>(flag, true));
+  return guards;
+}
+
+void appendLLVMFlagGuards(
+    std::vector<std::unique_ptr<ScopedLLVMOption<bool>>> &guards,
+    StringRef commaSeparatedFlags) {
+  llvm::SmallVector<StringRef, 3> split;
+  commaSeparatedFlags.split(split, ',');
+  for (StringRef flag : split)
+    guards.push_back(
+        std::make_unique<ScopedLLVMOption<bool>>(flag.str(), true));
+}
 
 std::unique_ptr<TargetMachine>
 createTargetMachine(llvm::Module *module, std::string proc,
@@ -173,22 +212,15 @@ void dumpSchedulingDAG(llvm::Module &module, const std::string &triple,
     return;
   }
 
-  // Apply flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  std::lock_guard<std::mutex> optionLock(getLLVMOptionMutex());
+  auto flagGuards = scopeLLVMFlags(flags);
 
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
     // Check to see if we are passing a list of flags to disable optimizations.
     auto flagList = triton::tools::getStrEnv("DISABLE_LLVM_OPT");
-    if (!flagList.empty()) {
-      llvm::SmallVector<StringRef, 3> split;
-      StringRef(flagList.c_str()).split(split, ',');
-      for (const auto &flag : split) {
-        setLLVMOption<bool>(flag.str(), true);
-      }
-    }
+    if (!flagList.empty())
+      appendLLVMFlagGuards(flagGuards, flagList);
   }
 
   std::string dumpFilename = dumpMirBase + "/" + dumpFileId + ".txt";
@@ -265,27 +297,21 @@ translateLLVMIRToMIR(llvm::Module &module, const std::string &triple,
 
   llvm::StripDebugInfo(module);
 
-  // Apply flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  std::lock_guard<std::mutex> optionLock(getLLVMOptionMutex());
+  auto flagGuards = scopeLLVMFlags(flags);
 
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
     // Check to see if we are passing a list of flags to disable optimizations.
     auto flagList = triton::tools::getStrEnv("DISABLE_LLVM_OPT");
-    if (!flagList.empty()) {
-      llvm::SmallVector<StringRef, 3> split;
-      StringRef(flagList.c_str()).split(split, ',');
-      for (const auto &flag : split) {
-        setLLVMOption<bool>(flag.str(), true);
-      }
-    }
+    if (!flagList.empty())
+      appendLLVMFlagGuards(flagGuards, flagList);
   }
 
-  if (triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
-    setLLVMOption<bool>("print-after-all", true);
-  }
+  std::unique_ptr<ScopedLLVMOption<bool>> printAfterAllGuard;
+  if (triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP"))
+    printAfterAllGuard =
+        std::make_unique<ScopedLLVMOption<bool>>("print-after-all", true);
 
   // Use RAII to set stop-before and restore it when scope exits
   ScopedLLVMOption<std::string> stopBeforeGuard("stop-before",
@@ -344,26 +370,20 @@ std::string translateLLVMIRToASM(
     bool enable_fp_fusion, bool isObject, bool canonicalizeGEP) {
   using namespace mlir;
 
-  // Apply flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  std::lock_guard<std::mutex> optionLock(getLLVMOptionMutex());
+  auto flagGuards = scopeLLVMFlags(flags);
 
-  if (triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
-    setLLVMOption<bool>("print-after-all", true);
-  }
+  std::unique_ptr<ScopedLLVMOption<bool>> printAfterAllGuard;
+  if (triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP"))
+    printAfterAllGuard =
+        std::make_unique<ScopedLLVMOption<bool>>("print-after-all", true);
 
   bool disableLLVMOpt = triton::tools::getBoolEnv("DISABLE_LLVM_OPT");
   if (!disableLLVMOpt) {
     // Check to see if we are passing a list of flags to disable optimizations.
     auto flagList = triton::tools::getStrEnv("DISABLE_LLVM_OPT");
-    if (!flagList.empty()) {
-      llvm::SmallVector<StringRef, 3> split;
-      StringRef(flagList.c_str()).split(split, ',');
-      for (const auto &flag : split) {
-        setLLVMOption<bool>(flag.str(), true);
-      }
-    }
+    if (!flagList.empty())
+      appendLLVMFlagGuards(flagGuards, flagList);
   }
 
   // Set up target information before inlining so target-specific inline
@@ -438,6 +458,8 @@ translateMIRToASM(const std::string &mirPath, const std::string &triple,
                   bool isObject, bool enableMISched) {
   using namespace mlir;
 
+  std::lock_guard<std::mutex> optionLock(getLLVMOptionMutex());
+
   // We need to start before machine-scheduler and disable it instead of simply
   // start after it because machine-scheduler is used as anchor point to insert
   // some passes. Starting after machine-scheduler would also not insert these
@@ -449,14 +471,12 @@ translateMIRToASM(const std::string &mirPath, const std::string &triple,
   ScopedLLVMOption<bool> enablePostMISchedGuard("enable-post-misched",
                                                 enableMISched);
 
-  if (triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
-    setLLVMOption<bool>("print-after-all", true);
-  }
+  std::unique_ptr<ScopedLLVMOption<bool>> printAfterAllGuard;
+  if (triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP"))
+    printAfterAllGuard =
+        std::make_unique<ScopedLLVMOption<bool>>("print-after-all", true);
 
-  // Apply other flags
-  for (const std::string &flag : flags) {
-    setLLVMOption<bool>(flag, true);
-  }
+  auto flagGuards = scopeLLVMFlags(flags);
 
   // Parse MIR into LLVM Module
   llvm::LLVMContext context;
@@ -697,16 +717,13 @@ void init_triton_llvm(py::module_ &m) {
          bool disable_vector_combine) {
         if (mlir::triton::tools::getBoolEnv("DISABLE_LLVM_OPT"))
           return;
+        std::lock_guard<std::mutex> optionLock(getLLVMOptionMutex());
+        auto flagGuards = scopeLLVMFlags(flags);
         // Check to see if we are passing a list of flags to disable
         // optimizations.
         auto flagList = mlir::triton::tools::getStrEnv("DISABLE_LLVM_OPT");
-        if (!flagList.empty()) {
-          llvm::SmallVector<StringRef, 3> split;
-          StringRef(flagList.c_str()).split(split, ',');
-          for (const auto &flag : split) {
-            setLLVMOption<bool>(flag.str(), true);
-          }
-        }
+        if (!flagList.empty())
+          appendLLVMFlagGuards(flagGuards, flagList);
         using namespace llvm;
         LoopAnalysisManager lam;
         FunctionAnalysisManager fam;
@@ -736,8 +753,10 @@ void init_triton_llvm(py::module_ &m) {
               });
           enablePassInstrumentation = true;
         }
+        std::unique_ptr<ScopedLLVMOption<bool>> printAfterAllGuard;
         if (mlir::triton::tools::getBoolEnv("LLVM_IR_ENABLE_DUMP")) {
-          setLLVMOption<bool>("print-after-all", true);
+          printAfterAllGuard =
+              std::make_unique<ScopedLLVMOption<bool>>("print-after-all", true);
           standardInstr.registerCallbacks(passInstrCb, &mam);
           enablePassInstrumentation = true;
         }
