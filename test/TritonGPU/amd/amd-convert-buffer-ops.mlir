@@ -708,6 +708,7 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
     %5 = tt.addptr %4, %2 : tensor<512x!tt.ptr<bf16>, #blocked>, tensor<512xi32, #blocked>
     // GFX942-ONLY-NOT: amdg.buffer_atomic_rmw
     // GFX950-PLUS: amdg.buffer_atomic_rmw
+    // GFX950-PLUS-SAME: contiguity = 2 : i32
     %6 = tt.atomic_rmw fadd, acq_rel, gpu, %5, %cst_0, %cst : (tensor<512x!tt.ptr<bf16>, #blocked>, tensor<512xbf16, #blocked>, tensor<512xi1, #blocked>) -> tensor<512xbf16, #blocked>
     tt.return
   }
