@@ -3764,6 +3764,13 @@ def scheduled_mfma_kernel():
         accumulator="transient",
         initialize=True,
     )
+    result0 = ttgl.amd.cdna4.scheduled_mfma(
+        a,
+        b,
+        result0,
+        resident_operand=1,
+        accumulator="transient",
+    )
     result1 = ttgl.amd.cdna4.scheduled_mfma(
         a,
         b,

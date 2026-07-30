@@ -768,11 +768,14 @@ def ScheduledMfmaOp : TT_AMDGPU_Op<"scheduled_mfma"> {
     for an accumulator carried across phases. Target lowering selects the
     corresponding storage. `initialize` starts the native accumulators from
     zero.
-    Completion of transient result fragments is represented separately by
-    `mfma_commit`, which can cover multiple independent chains and live
-    dependencies with one boundary. These scheduling roles are reusable across
-    kernels; native tuple widths are derived by lowering rather than exposed in
-    source.
+    A transient result has exactly one completion-chain use: either it is the
+    accumulator of another transient `scheduled_mfma`, or it is consumed
+    directly by `mfma_commit`. Consequently a source-scheduled reduction may
+    contain several dependent MFMA operations, but its terminal result cannot
+    bypass the completion boundary. `mfma_commit` can cover multiple independent
+    chains and live dependencies with one boundary. These scheduling roles are
+    reusable across kernels; native tuple widths are derived by lowering rather
+    than exposed in source.
 
     All active lanes of a wave must execute this operation uniformly.  This is
     an explicit source contract because the pinned MLIR `LLVM::InlineAsmOp`

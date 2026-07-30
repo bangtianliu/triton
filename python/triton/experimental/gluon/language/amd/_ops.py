@@ -90,9 +90,10 @@ def scheduled_mfma(a, b, acc, resident_operand=None, accumulator="persistent", i
     native tuples from the Gluon layouts.
 
     When ``initialize=True``, ``acc`` defines only result shape and layout and
-    the native accumulators start from zero. Use ``commit_mfma`` after the
-    final independent fragments to express their completion and live-through
-    dependencies.
+    the native accumulators start from zero. A transient result may be the
+    accumulator of one following transient ``scheduled_mfma``; the terminal
+    result must be passed directly to ``commit_mfma``. This expresses both the
+    dependency chain and its completion/live-through boundary.
 
     All active lanes of a wave must execute the operation uniformly. The
     pinned MLIR ``LLVM::InlineAsmOp`` has no convergent-call attribute, so this

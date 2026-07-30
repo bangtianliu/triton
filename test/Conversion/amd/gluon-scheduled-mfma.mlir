@@ -29,6 +29,34 @@ module attributes {
     tt.return
   }
 
+  // A phase-local reduction may span multiple source-scheduled MFMAs. The
+  // intermediate result remains on the MFMA dependency chain; only the
+  // terminal result crosses the completion boundary.
+  // CHECK-LABEL: llvm.func @transient_mfma_chain
+  // CHECK: llvm.inline_asm has_side_effects
+  // CHECK-SAME: "v_mfma_f32_16x16x32_bf16 $0, $1, $2, 0", "=&v,a,v"
+  // CHECK: llvm.inline_asm has_side_effects
+  // CHECK-SAME: "v_mfma_f32_16x16x32_bf16 $0, $1, $2, $0", "=&v,a,v,0"
+  // CHECK: llvm.inline_asm has_side_effects
+  // CHECK-SAME: "s_nop 5", "=v,=a,0,1,~{memory}"
+  // CHECK-NOT: amdg.
+  tt.func public @transient_mfma_chain() {
+    %a = arith.constant dense<1.000000e+00> : tensor<16x32xbf16, #lhs>
+    %b = arith.constant dense<2.000000e+00> : tensor<32x16xbf16, #rhs>
+    %acc = arith.constant dense<0.000000e+00> : tensor<16x16xf32, #mma>
+    %partial = amdg.scheduled_mfma %a, %b, %acc
+        resident "rhs" accumulator "transient" initialize true
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %result = amdg.scheduled_mfma %a, %b, %partial
+        resident "rhs" accumulator "transient" initialize false
+        : tensor<16x32xbf16, #lhs>, tensor<32x16xbf16, #rhs>,
+          tensor<16x16xf32, #mma> -> tensor<16x16xf32, #mma>
+    %committed, %preserved = amdg.mfma_commit %result, %b
+        : tensor<16x16xf32, #mma>, tensor<32x16xbf16, #rhs>
+    tt.return
+  }
+
   // Two independent result fragments share one completion boundary. All
   // result fragments and the live dependency are tied through its outputs.
   // CHECK-LABEL: llvm.func @multi_fragment_commit

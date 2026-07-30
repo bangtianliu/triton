@@ -983,6 +983,21 @@ LogicalResult ScheduledMfmaOp::verify() {
       getAccumulatorRole() != "persistent")
     return emitOpError(
         "accumulator_role must be \"transient\" or \"persistent\"");
+  if (getAccumulatorRole() == "transient") {
+    if (!getResult().hasOneUse())
+      return emitOpError(
+          "transient result must have exactly one completion-chain use");
+
+    Operation *user = *getResult().getUsers().begin();
+    if (!isa<MfmaCommitOp>(user)) {
+      auto continuation = dyn_cast<ScheduledMfmaOp>(user);
+      if (!continuation || continuation.getAcc() != getResult() ||
+          continuation.getAccumulatorRole() != "transient")
+        return emitOpError(
+            "transient result must be consumed by amdg.mfma_commit or as the "
+            "accumulator of another transient amdg.scheduled_mfma");
+    }
+  }
 
   return success();
 }
