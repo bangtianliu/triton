@@ -1,5 +1,7 @@
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/BuiltinTypes.h"
 #include "mlir/IR/Diagnostics.h"
+#include "mlir/Interfaces/ViewLikeInterface.h"
 #include "mlir/Support/DebugStringHelper.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "triton/Dialect/Triton/IR/Utility.h"
@@ -14,29 +16,6 @@
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/LogicalResult.h"
 #include "llvm/Support/MathExtras.h"
-
-// Provide custom directive handlers for declarative assemblyFormat.
-// They must be visible before including the generated op classes.
-static mlir::ParseResult parseOffsets(mlir::OpAsmParser &p,
-                                      mlir::DenseI32ArrayAttr &attr) {
-  llvm::SmallVector<int32_t> values;
-  if (p.parseCommaSeparatedList([&]() {
-        int32_t v;
-        if (p.parseInteger(v))
-          return mlir::failure();
-        values.push_back(v);
-        return mlir::success();
-      }))
-    return mlir::failure();
-  attr = p.getBuilder().getDenseI32ArrayAttr(values);
-  return mlir::success();
-}
-
-static void printOffsets(mlir::OpAsmPrinter &p, mlir::Operation *op,
-                         mlir::DenseI32ArrayAttr attr) {
-  auto vals = attr.asArrayRef();
-  llvm::interleaveComma(vals, p, [&](int32_t v) { p << v; });
-}
 
 #define GET_OP_CLASSES
 #include "triton/Dialect/TritonGPU/IR/Ops.cpp.inc"
@@ -1201,22 +1180,64 @@ LogicalResult MemDescIndexOp::verify() {
   return success();
 }
 
+void MemDescSubsliceOp::build(OpBuilder &builder, OperationState &state,
+                              Type resultType, Value src,
+                              ArrayRef<int32_t> offsets) {
+  SmallVector<int64_t> staticOffsets(offsets.begin(), offsets.end());
+  build(builder, state, resultType, src, ValueRange{},
+        builder.getDenseI64ArrayAttr(staticOffsets));
+}
+
+void MemDescSubsliceOp::build(OpBuilder &builder, OperationState &state,
+                              Type resultType, Value src,
+                              ArrayRef<OpFoldResult> offsets) {
+  SmallVector<int64_t> staticOffsets;
+  SmallVector<Value> dynamicOffsets;
+  dispatchIndexOpFoldResults(offsets, dynamicOffsets, staticOffsets);
+  build(builder, state, resultType, src, dynamicOffsets,
+        builder.getDenseI64ArrayAttr(staticOffsets));
+}
+
+SmallVector<OpFoldResult> MemDescSubsliceOp::getMixedOffsets() {
+  return getMixedValues(getOffsets(), getDynamicOffsets(), getContext());
+}
+
 OpFoldResult MemDescSubsliceOp::fold(FoldAdaptor adaptor) {
+  if (!getDynamicOffsets().empty()) {
+    SmallVector<int64_t> staticOffsets;
+    SmallVector<Value> dynamicOffsets;
+    for (OpFoldResult offset : getMixedOffsets()) {
+      if (auto value = getConstantIntValue(offset)) {
+        staticOffsets.push_back(*value);
+      } else {
+        staticOffsets.push_back(ShapedType::kDynamic);
+        dynamicOffsets.push_back(cast<Value>(offset));
+      }
+    }
+    if (dynamicOffsets.size() != getDynamicOffsets().size()) {
+      getDynamicOffsetsMutable().assign(dynamicOffsets);
+      setOffsetsAttr(DenseI64ArrayAttr::get(getContext(), staticOffsets));
+      return getResult();
+    }
+    return {};
+  }
   // Fold subslice(subslice(x, off1), off2) -> subslice(x, off1 + off2)
   if (auto srcSubslice = getSrc().getDefiningOp<MemDescSubsliceOp>()) {
+    if (!srcSubslice.getDynamicOffsets().empty())
+      return {};
     auto srcOffsets = srcSubslice.getOffsets();
     auto currOffsets = getOffsets();
 
     // Compute combined offsets
-    SmallVector<int32_t> combinedOffsets;
+    SmallVector<int64_t> combinedOffsets;
     for (size_t i = 0; i < currOffsets.size(); ++i) {
       combinedOffsets.push_back(srcOffsets[i] + currOffsets[i]);
     }
 
     // Update this operation to point directly to the original source with
     // combined offsets
-    setOperand(srcSubslice.getSrc());
-    setOffsetsAttr(DenseI32ArrayAttr::get(getContext(), combinedOffsets));
+    getSrcMutable().assign(srcSubslice.getSrc());
+    setOffsetsAttr(DenseI64ArrayAttr::get(getContext(), combinedOffsets));
     return getResult();
   }
 
@@ -1226,15 +1247,31 @@ OpFoldResult MemDescSubsliceOp::fold(FoldAdaptor adaptor) {
 LogicalResult MemDescSubsliceOp::verify() {
   auto srcTy = getSrc().getType();
   auto dstTy = getType();
-
+  if (getOffsets().size() != srcTy.getRank())
+    return emitError("offsets must have the same rank as input");
+  if (failed(verifyListOfOperandsOrIntegers(*this, "offsets", srcTy.getRank(),
+                                            getOffsets(), getDynamicOffsets())))
+    return failure();
+  if (!getDynamicOffsets().empty()) {
+    if (lookupNumCTAs(*this) != 1)
+      return emitError("dynamic subslicing requires a single-CTA kernel");
+    if (srcTy.getMemorySpace() != dstTy.getMemorySpace())
+      return emitError("source and result must have the same memory space");
+    if (srcTy.getMutableMemory() != dstTy.getMutableMemory())
+      return emitError("source and result must have the same mutability");
+  }
+  SmallVector<std::optional<int64_t>> offsets;
+  for (OpFoldResult offset : getMixedOffsets()) {
+    auto value = getConstantIntValue(offset);
+    if (value && !llvm::isInt<32>(*value))
+      return emitError("offsets must fit in i32");
+    offsets.push_back(value);
+  }
   if (srcTy.getElementType() != dstTy.getElementType()) {
     return emitError("result element type must match desc element type");
   }
   if (srcTy.getEncoding() != dstTy.getEncoding()) {
     return emitError("src and result must have the same encoding");
-  }
-  if (getOffsets().size() != srcTy.getRank()) {
-    return emitError("offsets must have the same rank as input");
   }
   if (srcTy.getRank() != dstTy.getRank()) {
     return emitError("result rank must equal to input rank");
@@ -1255,12 +1292,16 @@ LogicalResult MemDescSubsliceOp::verify() {
 
   SetVector<int> splitDims{};
   for (int i = 0; i < srcTy.getRank(); i++) {
+    if (!offsets[i] && dstTy.getDimSize(i) > srcTy.getDimSize(i))
+      return emitError("result dimensions must not exceed the source shape");
     if (srcTy.getDimSize(i) != dstTy.getDimSize(i)) {
       splitDims.insert(i);
     }
   }
-  SmallVector<int64_t> offsets(getOffsets().begin(), getOffsets().end());
-  for (auto [dim, offset] : llvm::enumerate(offsets)) {
+  for (auto [dim, knownOffset] : llvm::enumerate(offsets)) {
+    if (!knownOffset)
+      continue;
+    int64_t offset = *knownOffset;
     if (!splitDims.contains(dim)) {
       if (offset != 0) {
         return emitError("A non zero offset found in a dimension that is "

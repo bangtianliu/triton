@@ -452,24 +452,34 @@ struct MemDescSubsliceOpConversion
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
     auto b = TritonLLVMOpBuilder(loc, rewriter);
-    auto *ctx = op.getContext();
     auto srcTy = op.getSrc().getType();
     auto llvmElemTy = getTypeConverter()->convertType(srcTy.getElementType());
 
     auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                    llvmElemTy, rewriter);
-    auto opOffsetVals = op.getOffsets();
+    auto staticOffsets = op.getOffsets();
+    SmallVector<Value> opOffsetVals;
+    unsigned dynamicOffsetIdx = 0;
+    for (int64_t offset : staticOffsets) {
+      if (ShapedType::isDynamic(offset))
+        opOffsetVals.push_back(adaptor.getDynamicOffsets()[dynamicOffsetIdx++]);
+      else
+        opOffsetVals.push_back(b.i32_val(offset));
+    }
     auto encoding = srcTy.getEncoding();
-    auto layoutOffsets = dropPipeliningDim(opOffsetVals, encoding);
+    auto layoutOffsets = dropPipeliningDim(ArrayRef(opOffsetVals), encoding);
+    auto layoutStaticOffsets = dropPipeliningDim(staticOffsets, encoding);
     SmallVector<Value> newBases = llvm::to_vector(smemObj.getBases());
 
     if (layoutOffsets.size() != opOffsetVals.size() &&
-        opOffsetVals.front() != 0) {
+        staticOffsets.front() != 0) {
       int64_t stride = getAllocationElems(
           encoding, dropPipeliningDim(srcTy.getAllocShape(), encoding));
       if (auto partEnc = dyn_cast<PartitionedSharedEncodingAttr>(encoding))
         stride /= partEnc.getNumPartitions();
-      Value offset = b.i32_val(opOffsetVals.front() * stride);
+      Value offset = ShapedType::isDynamic(staticOffsets.front())
+                         ? b.mul(opOffsetVals.front(), b.i32_val(stride))
+                         : b.i32_val(staticOffsets.front() * stride);
       for (Value &base : newBases)
         base = b.gep(base.getType(), llvmElemTy, base, offset);
     }
@@ -478,24 +488,31 @@ struct MemDescSubsliceOpConversion
     SmallVector<Value> offsetVals;
     for (auto [oldOffVal, opOff] :
          llvm::zip(smemObj.getOffsets(), opOffsetVals)) {
-      offsetVals.push_back(b.add(oldOffVal, b.i32_val(opOff)));
+      offsetVals.push_back(b.add(oldOffVal, opOff));
     }
 
-    // Partition pieces repeat independently within each CTA, with partitions
-    // varying faster than groups. The logical piece selected by the static
-    // offset therefore determines the physical base rotation directly.
+    // Partition pieces repeat independently within each CTA.
+    // Partitions vary faster than groups. This op's offset selects the base
+    // rotation.
     if (auto part = dyn_cast<PartitionedSharedEncodingAttr>(encoding)) {
       auto allocShape = dropPipeliningDim(srcTy.getAllocShape(), encoding);
       auto shapePerCTA = getShapePerCTA(part, allocShape);
       unsigned dim = part.getPartitionDim();
       int64_t pieceSize = shapePerCTA[dim] / part.getNumLogicalPieces();
-      unsigned partitionShift =
-          (layoutOffsets[dim] / pieceSize) % part.getNumPartitions();
-
-      SmallVector<Value> rotated(newBases.size());
-      for (size_t i = 0; i < newBases.size(); ++i)
-        rotated[i] = newBases[i ^ partitionShift];
-      newBases = std::move(rotated);
+      if (ShapedType::isDynamic(layoutStaticOffsets[dim])) {
+        Value piece = b.udiv(layoutOffsets[dim], b.i32_val(pieceSize));
+        Value shift = b.urem(piece, b.i32_val(part.getNumPartitions()));
+        Value basesVec = LLVM::buildBasePtrVector(loc, rewriter, newBases);
+        for (auto [i, base] : llvm::enumerate(newBases))
+          base = b.extract_element(basesVec, b.xor_(shift, b.i32_val(i)));
+      } else {
+        unsigned partitionShift =
+            (layoutStaticOffsets[dim] / pieceSize) % part.getNumPartitions();
+        SmallVector<Value> rotated(newBases.size());
+        for (size_t i = 0; i < newBases.size(); ++i)
+          rotated[i] = newBases[i ^ partitionShift];
+        newBases = std::move(rotated);
+      }
     }
 
     smemObj = SharedMemoryObject(newBases, llvmElemTy, offsetVals);
