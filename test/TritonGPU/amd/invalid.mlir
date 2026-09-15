@@ -821,3 +821,71 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tdm_store_strided_subview(%desc: !tt.tensordesc<16x64xf16, #shared>, %src: !ttg.memdesc<16x64xf16, #shared, #smem, mutable, 16x128>) {
+    // expected-error @below {{TDM shared-memory subviews require a contiguous}}
+    amdg.async_tdm_copy_local_to_global %desc from %src : !ttg.memdesc<16x64xf16, #shared, #smem, mutable, 16x128> -> !tt.tensordesc<16x64xf16, #shared>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [2, 1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tdm_store_leading_unit_strided_subview(%desc: !tt.tensordesc<1x16x64xf16, #shared>, %src: !ttg.memdesc<1x16x64xf16, #shared, #smem, 1x16x128>) {
+    // expected-error @below {{TDM shared-memory subviews require a contiguous}}
+    amdg.async_tdm_copy_local_to_global %desc from %src : !ttg.memdesc<1x16x64xf16, #shared, #smem, 1x16x128> -> !tt.tensordesc<1x16x64xf16, #shared>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tdm_fused_load_strided_subview(%desc: !tt.tensordesc<16x64xf16, #shared>, %dst0: !ttg.memdesc<16x64xf16, #shared, #smem, mutable>, %dst1: !ttg.memdesc<16x64xf16, #shared, #smem, mutable, 16x128>) {
+    // expected-error @below {{TDM shared-memory subviews require a contiguous}}
+    %token = amdg.async_tdm_fused_copy_global_to_local %desc, %desc into %dst0, %dst1 {warp_used_hints = array<i32: 1, 2>} : !tt.tensordesc<16x64xf16, #shared>, !tt.tensordesc<16x64xf16, #shared> -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable>, !ttg.memdesc<16x64xf16, #shared, #smem, mutable, 16x128>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#padded = #ttg.padded_shared<[64:+8] {order = [1, 0], shape = [32, 64]}>
+#padded_tile = #ttg.padded_shared<[64:+8] {order = [1, 0], shape = [16, 64]}>
+#partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 1, partitionDim = 0, partitionLayout = #shared}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tdm_load_padded_subview(%desc: !tt.tensordesc<16x64xf16, #padded_tile>, %dst: !ttg.memdesc<16x64xf16, #padded, #smem, mutable, 32x64>) {
+    // expected-error @below {{TDM shared-memory subviews require a contiguous}}
+    %token = amdg.async_tdm_copy_global_to_local %desc into %dst : !tt.tensordesc<16x64xf16, #padded_tile> -> !ttg.memdesc<16x64xf16, #padded, #smem, mutable, 32x64>
+    tt.return
+  }
+  tt.func @tdm_load_partitioned_subview(%desc: !tt.tensordesc<16x64xf16, #partitioned>, %dst: !ttg.memdesc<16x64xf16, #partitioned, #smem, mutable, 32x64>) {
+    // expected-error @below {{TDM shared-memory subviews require a contiguous}}
+    %token = amdg.async_tdm_copy_global_to_local %desc into %dst : !tt.tensordesc<16x64xf16, #partitioned> -> !ttg.memdesc<16x64xf16, #partitioned, #smem, mutable, 32x64>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[0, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  tt.func @tdm_load_multi_cta_subview(%desc: !tt.tensordesc<16x64xf16, #shared>, %dst: !ttg.memdesc<16x64xf16, #shared, #smem, mutable, 32x64>) {
+    // expected-error @below {{TDM shared-memory subviews require a contiguous}}
+    %token = amdg.async_tdm_copy_global_to_local %desc into %dst : !tt.tensordesc<16x64xf16, #shared> -> !ttg.memdesc<16x64xf16, #shared, #smem, mutable, 32x64>
+    tt.return
+  }
+}

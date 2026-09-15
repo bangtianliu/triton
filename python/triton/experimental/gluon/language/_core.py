@@ -525,10 +525,18 @@ class shared_memory_descriptor(base_value):
         """
         Create a subview of shared memory by slicing along a given dimension.
 
+        The subview preserves rank and layout. The start may be a runtime scalar
+        of type ``int32``; length and dimension must be compile-time constants.
+        The slice must stay within this descriptor's shape. In a layout dimension,
+        the start must be a multiple of the slice length. These are preconditions
+        for runtime starts and are not checked at runtime. The existing layout
+        restrictions on slicing also apply to runtime starts. Runtime starts
+        require ``num_ctas=1``.
+
         Args:
-            start (int): The starting index of the slice.
-            length (int): The length of the slice.
-            dim (int): The dimension to slice (default: 0).
+            start (int or tensor): The starting index of the slice.
+            length (int): The compile-time length of the slice.
+            dim (int): The compile-time dimension to slice (default: 0).
 
         Returns:
             shared_memory_descriptor: Descriptor for the sliced subview.

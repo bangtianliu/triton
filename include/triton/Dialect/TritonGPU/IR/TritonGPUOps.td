@@ -264,28 +264,45 @@ def TTG_MemDescSubsliceOp : TTG_Op<"memdesc_subslice", [Pure, MemDescViewTrait]>
   let summary = "take a subview of the descriptor.";
 
   let description = [{
-    This operation returns a new descriptor representing a subview of the logical tensor.
-    It doesn't affect the underlying memory.
+    Returns a same-rank subview, preserving the source encoding and allocation
+    shape. Offsets may be static integers or runtime i32 values. Runtime offsets
+    are uniform within the logical block or warp-specialized execution region
+    and require a single-CTA kernel.
 
-    For example, suppose that
-     - the input shape is 32x16xf16,
-     - the output shape is 8x16xf16, and
-     - offsets = [2, 1].
-    Then in Python syntax, the subview covers input[2:8+2, 1:16+1] where input is
-    the logical tensor.
+    For example, an 8x16 subview of a 32x16 descriptor with offsets [16, 0]
+    covers input[16:24, 0:16].
 
-    The offsets must be larger or equal to the tile of the tensor (or zero).
+    The caller must ensure that offsets keep the view within the source shape
+    and are multiples of the result dimension size, except along a leading
+    pipeline dimension, which needs no tile alignment. Offsets in unchanged
+    dimensions must be zero. Statically known offsets are verified; violating
+    these requirements at runtime is undefined behavior. The layout and tile
+    restrictions are the same for static and runtime offsets.
+
+    This operation does not access the underlying memory.
   }];
-  let arguments = (ins TTG_MemDescType:$src, DenseI32ArrayAttr:$offsets);
+  let arguments = (ins TTG_MemDescType:$src, Variadic<I32>:$dynamicOffsets,
+                       DenseI64ArrayAttr:$offsets);
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".
   // Render offsets inline as %src[0, 0] via a custom directive, but keep
   // the overall parse/print generated from this assemblyFormat.
   let assemblyFormat = [{
-    $src `[` custom<Offsets>($offsets) `]` attr-dict `:` qualified(type($src))
+    $src `` custom<DynamicIndexList>($dynamicOffsets, $offsets) attr-dict `:` qualified(type($src))
     `->` qualified(type($result))
   }];
 
   let results = (outs TTG_MemDescType:$result);
+
+  let builders = [
+    OpBuilder<(ins "Type":$resultType, "Value":$src,
+                   "ArrayRef<int32_t>":$offsets)>,
+    OpBuilder<(ins "Type":$resultType, "Value":$src,
+                   "ArrayRef<OpFoldResult>":$offsets)>
+  ];
+
+  let extraClassDeclaration = [{
+    SmallVector<OpFoldResult> getMixedOffsets();
+  }];
 
   let hasFolder = 1;
   let hasVerifier = 1;

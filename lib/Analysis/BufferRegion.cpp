@@ -2,6 +2,7 @@
 
 #include "mlir/Analysis/DataFlow/DeadCodeAnalysis.h"
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/IR/Matchers.h"
 #include "mlir/Interfaces/CallInterfaces.h"
 #include "mlir/Interfaces/FunctionInterfaces.h"
@@ -256,9 +257,9 @@ struct MemDescSubsliceOffsets {
 };
 
 MemDescSubsliceOffsets
-getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op) {
+getMemDescSubsliceUnpaddedOffsets(ttg::MemDescSubsliceOp op,
+                                  ArrayRef<int64_t> offsets) {
   auto srcTy = op.getSrc().getType();
-  auto offsets = op.getOffsets();
   if (offsets.empty())
     return MemDescSubsliceOffsets{};
 
@@ -730,15 +731,58 @@ LogicalResult BufferRegionAnalysis::visitOperation(
   }
   if (auto memdescSubsliceOp = dyn_cast<ttg::MemDescSubsliceOp>(op)) {
     const RegionInfo &in = operands[0]->getValue();
-    if (in.isUnknown())
+    if (in.isUnknown() || in.views.empty())
       return propagateRegions(in);
-    MemDescSubsliceOffsets relativeOffset =
-        getMemDescSubsliceUnpaddedOffsets(memdescSubsliceOp);
-    for (const BufferRegionView &view : in.views)
-      regionInfo.views.insert(
-          getSubView(memdescSubsliceOp.getType(), view,
-                     relativeOffset.storageOffset, relativeOffset.byteOffset,
-                     relativeOffset.partitionOffset, relativeOffset.ctaOffset));
+
+    auto dstTy = memdescSubsliceOp.getType();
+    auto addViews = [&](ArrayRef<int64_t> offsets) {
+      MemDescSubsliceOffsets relativeOffset =
+          getMemDescSubsliceUnpaddedOffsets(memdescSubsliceOp, offsets);
+      for (const BufferRegionView &view : in.views)
+        regionInfo.views.insert(getSubView(
+            dstTy, view, relativeOffset.storageOffset,
+            relativeOffset.byteOffset, relativeOffset.partitionOffset,
+            relativeOffset.ctaOffset));
+    };
+    auto mixedOffsets = memdescSubsliceOp.getMixedOffsets();
+    if (auto offsets = getConstantIntValues(mixedOffsets)) {
+      addViews(*offsets);
+      return propagateRegions(regionInfo);
+    }
+
+    size_t numOffsets = 1;
+    auto srcTy = memdescSubsliceOp.getSrc().getType();
+    unsigned prefixRank =
+        srcTy.getRank() -
+        ttg::dropPipeliningDim(srcTy.getShape(), srcTy.getEncoding()).size();
+    SmallVector<SmallVector<int64_t>> offsetsByDim;
+    for (auto [dim, value] : llvm::enumerate(mixedOffsets)) {
+      int64_t first = 0;
+      int64_t step = dim < prefixRank ? 1 : dstTy.getDimSize(dim);
+      int64_t count = 1;
+      if (auto constant = getConstantIntValue(value)) {
+        first = *constant;
+      } else {
+        // Valid offsets are tile-aligned, except for the pipeline prefix.
+        // Unchanged dimensions have only the zero offset.
+        count = (srcTy.getDimSize(dim) - dstTy.getDimSize(dim)) / step + 1;
+      }
+      numOffsets *= count;
+      SmallVector<int64_t> offsets;
+      for (int64_t i = 0; i < count; ++i)
+        offsets.push_back(first + i * step);
+      offsetsByDim.push_back(std::move(offsets));
+    }
+
+    SmallVector<int64_t> offsets(srcTy.getRank());
+    for (size_t candidate = 0; candidate < numOffsets; ++candidate) {
+      size_t remaining = candidate;
+      for (auto [dim, values] : llvm::enumerate(offsetsByDim)) {
+        offsets[dim] = values[remaining % values.size()];
+        remaining /= values.size();
+      }
+      addViews(offsets);
+    }
     return propagateRegions(regionInfo);
   }
   if (auto tmemSubsliceOp = dyn_cast<ttng::TMEMSubSliceOp>(op)) {

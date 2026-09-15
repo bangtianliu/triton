@@ -458,18 +458,29 @@ struct MemDescSubsliceOpConversion
 
     auto smemObj = getSharedMemoryObjectFromStruct(loc, adaptor.getSrc(),
                                                    llvmElemTy, rewriter);
-    auto opOffsetVals = op.getOffsets();
+    auto staticOffsets = op.getOffsets();
+    SmallVector<Value> opOffsetVals;
+    unsigned dynamicOffsetIdx = 0;
+    for (int64_t offset : staticOffsets) {
+      if (ShapedType::isDynamic(offset))
+        opOffsetVals.push_back(adaptor.getDynamicOffsets()[dynamicOffsetIdx++]);
+      else
+        opOffsetVals.push_back(b.i32_val(offset));
+    }
     auto encoding = srcTy.getEncoding();
-    auto layoutOffsets = dropPipeliningDim(opOffsetVals, encoding);
+    auto layoutOffsets = dropPipeliningDim(ArrayRef(opOffsetVals), encoding);
+    auto layoutStaticOffsets = dropPipeliningDim(staticOffsets, encoding);
     SmallVector<Value> newBases = llvm::to_vector(smemObj.getBases());
 
     if (layoutOffsets.size() != opOffsetVals.size() &&
-        opOffsetVals.front() != 0) {
+        staticOffsets.front() != 0) {
       int64_t stride = getAllocationElems(
           encoding, dropPipeliningDim(srcTy.getAllocShape(), encoding));
       if (auto partEnc = dyn_cast<PartitionedSharedEncodingAttr>(encoding))
         stride /= partEnc.getNumPartitions();
-      Value offset = b.i32_val(opOffsetVals.front() * stride);
+      Value offset = ShapedType::isDynamic(staticOffsets.front())
+                         ? b.mul(opOffsetVals.front(), b.i32_val(stride))
+                         : b.i32_val(staticOffsets.front() * stride);
       for (Value &base : newBases)
         base = b.gep(base.getType(), llvmElemTy, base, offset);
     }
@@ -478,18 +489,18 @@ struct MemDescSubsliceOpConversion
     SmallVector<Value> offsetVals;
     for (auto [oldOffVal, opOff] :
          llvm::zip(smemObj.getOffsets(), opOffsetVals)) {
-      offsetVals.push_back(b.add(oldOffVal, b.i32_val(opOff)));
+      offsetVals.push_back(b.add(oldOffVal, opOff));
     }
 
     // For PartitionedSharedEncoding we need to pick the right base at load
     // time. Let
-    //   o     = this op's static subslice offsets (one per dim),
+    //   o     = this op's subslice offsets (one per dim),
     //   c     = a logical base indices to the current subslice op,
     //   L     = the shared LL (inputs: offset, partition, block;
     //                          outputs: dim0, dim1, ...).
     //
     //   (1) c_src = c + o
-    //   (2) verifier makes o's bits disjoint from c's bits per dim, so:
+    //   (2) the slice contract makes o's bits disjoint from c's bits per dim:
     //         c + o = c ^ o                                   (bit-disjoint)
     //   (3) L^-1 is linear, so projecting (2) onto the partition component:
     //         partition(L^-1(c_src)) = partition(L^-1(c)) ^ S
@@ -508,15 +519,27 @@ struct MemDescSubsliceOpConversion
       assert(ll.hasInDim(kPartition) &&
              "multiple bases require a partition input dim");
       auto dimNames = standardOutDimNames(ctx, layoutOffsets.size());
-      SmallVector<std::pair<StringAttr, int32_t>> namedOffsets;
-      for (auto [dim, off] : llvm::zip(dimNames, layoutOffsets))
-        namedOffsets.push_back({dim, off});
       auto partitionLayout = ll.invert().sublayout(dimNames, {kPartition});
-      int32_t partitionShift = partitionLayout.apply(namedOffsets)[0].second;
-      SmallVector<Value> rotated(newBases.size());
-      for (size_t i = 0; i < newBases.size(); ++i)
-        rotated[i] = newBases[i ^ partitionShift];
-      newBases = std::move(rotated);
+      if (llvm::is_contained(layoutStaticOffsets, ShapedType::kDynamic)) {
+        SmallVector<std::pair<StringAttr, Value>> namedOffsets;
+        for (auto [dim, offset] : llvm::zip_equal(dimNames, layoutOffsets))
+          namedOffsets.push_back({dim, offset});
+        Value shift =
+            applyLinearLayout(loc, rewriter, partitionLayout, namedOffsets)[0]
+                .second;
+        Value basesVec = LLVM::buildBasePtrVector(loc, rewriter, newBases);
+        for (auto [i, base] : llvm::enumerate(newBases))
+          base = b.extract_element(basesVec, b.xor_(shift, b.i32_val(i)));
+      } else {
+        SmallVector<std::pair<StringAttr, int32_t>> namedOffsets;
+        for (auto [dim, off] : llvm::zip(dimNames, layoutStaticOffsets))
+          namedOffsets.push_back({dim, static_cast<int32_t>(off)});
+        int32_t partitionShift = partitionLayout.apply(namedOffsets)[0].second;
+        SmallVector<Value> rotated(newBases.size());
+        for (size_t i = 0; i < newBases.size(); ++i)
+          rotated[i] = newBases[i ^ partitionShift];
+        newBases = std::move(rotated);
+      }
     }
 
     smemObj = SharedMemoryObject(newBases, llvmElemTy, offsetVals);

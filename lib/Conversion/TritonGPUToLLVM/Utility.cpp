@@ -49,10 +49,15 @@ Value triton::getMemDescAddress(RewriterBase &rewriter, Location loc,
   auto object =
       LLVM::getSharedMemoryObjectFromStruct(loc, lowered, elemTy, rewriter);
   auto offset = object.getShmemOffset(loc, rewriter, type);
-  offset = b.mul(offset, b.i32_val(getIntOrFloatOrPtrBitWidth(elemTy) / 8));
+  unsigned bitwidth = getIntOrFloatOrPtrBitWidth(elemTy);
+  offset = b.mul(offset, b.i32_val(bitwidth / 8));
+  auto paddingShifts = getPaddedSharedShifts(type.getEncoding(), bitwidth,
+                                             /*offsetInBytes=*/true);
+  offset = applyPadding(loc, rewriter, offset, paddingShifts);
+  // Partitioned slices rotate their bases so the first is the logical origin.
+  auto base = b.ptrtoint(i32Ty, object.getBases().front());
   // Strip the cluster CTA index from shared addresses.
-  return b.and_(b.add(offset, b.ptrtoint(i32Ty, object.getBase())),
-                b.i32_val((1u << 24) - 1));
+  return b.and_(b.add(offset, base), b.i32_val((1u << 24) - 1));
 }
 
 namespace triton::gpu {
@@ -900,14 +905,12 @@ lowerLdSt(Location loc, MLIRContext *ctx, LinearLayout cvt,
       targetCtaId = b.xor_(targetCtaId, affineBlockOffset);
   }
 
-  // It's fine that we don't compute the offset in bytes as affineOffset
-  // will be folded into a constant
   auto affineOffsetI8 = b.mul(affineOffset, b.i32_val(bitwidth / 8));
   bool hasPadding = !paddingShifts.empty();
   Value paddedAffineOffsetI8 = b.i32_val(0);
   if (hasPadding && maskSpanAffineOffset != 0) {
     // `maskSpanAffineOffset != 0` indicates the affine offsets come from
-    // MemDescSubsliceOp, whose verifier guarantees that the affine offsets are
+    // subslicing, whose preconditions guarantee that the affine offsets are
     // bitwise disjoint from other offset contributors. Padding can thus be
     // applied separately. This helps LLVM reuse base pointers.
     paddedAffineOffsetI8 =

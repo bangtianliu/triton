@@ -398,6 +398,50 @@ tt.func @fold_subslice_chain() {
 
 // -----
 
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+// CHECK-LABEL: @subslice_mixed_offsets
+tt.func @subslice_mixed_offsets(%src: !ttg.memdesc<32x64xf32, #shared, #smem>, %column: i32) -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64> {
+  // CHECK: %[[VIEW:.*]] = ttg.memdesc_subslice %arg0[16, %arg1]
+  %view = ttg.memdesc_subslice %src[16, %column] : !ttg.memdesc<32x64xf32, #shared, #smem> -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+  // CHECK-NEXT: tt.return %[[VIEW]]
+  tt.return %view : !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+}
+
+// CHECK-LABEL: @fold_subslice_constant_row
+tt.func @fold_subslice_constant_row(%src: !ttg.memdesc<32x64xf32, #shared, #smem>, %column: i32) -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64> {
+  %row = arith.constant 16 : i32
+  // CHECK-NOT: arith.constant
+  // CHECK: %[[VIEW:.*]] = ttg.memdesc_subslice %arg0[16, %arg1]
+  %view = ttg.memdesc_subslice %src[%row, %column] : !ttg.memdesc<32x64xf32, #shared, #smem> -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+  // CHECK-NEXT: tt.return %[[VIEW]]
+  tt.return %view : !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+}
+
+// CHECK-LABEL: @fold_subslice_constant_offsets
+tt.func @fold_subslice_constant_offsets(%src: !ttg.memdesc<32x64xf32, #shared, #smem>) -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64> {
+  %row = arith.constant 16 : i32
+  %column = arith.constant 32 : i32
+  // CHECK-NOT: arith.constant
+  // CHECK: %[[VIEW:.*]] = ttg.memdesc_subslice %arg0[16, 32]
+  %view = ttg.memdesc_subslice %src[%row, %column] : !ttg.memdesc<32x64xf32, #shared, #smem> -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+  // CHECK-NEXT: tt.return %[[VIEW]]
+  tt.return %view : !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+}
+
+// CHECK-LABEL: @preserve_subslice_runtime_parent
+tt.func @preserve_subslice_runtime_parent(%src: !ttg.memdesc<32x64xf32, #shared, #smem>, %row: i32) -> !ttg.memdesc<8x32xf32, #shared, #smem, 32x64> {
+  // CHECK: %[[PARENT:.*]] = ttg.memdesc_subslice %arg0[%arg1, 0]
+  %parent = ttg.memdesc_subslice %src[%row, 0] : !ttg.memdesc<32x64xf32, #shared, #smem> -> !ttg.memdesc<16x64xf32, #shared, #smem, 32x64>
+  // CHECK-NEXT: %[[CHILD:.*]] = ttg.memdesc_subslice %[[PARENT]][8, 32]
+  %child = ttg.memdesc_subslice %parent[8, 32] : !ttg.memdesc<16x64xf32, #shared, #smem, 32x64> -> !ttg.memdesc<8x32xf32, #shared, #smem, 32x64>
+  // CHECK-NEXT: tt.return %[[CHILD]]
+  tt.return %child : !ttg.memdesc<8x32xf32, #shared, #smem, 32x64>
+}
+
+// -----
+
 #src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 #slice = #ttg.slice<{dim = 0, parent = #parent}>
