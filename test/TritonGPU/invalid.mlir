@@ -1009,3 +1009,118 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+tt.func @dynamic_subslice_offset_count(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %row: i32) {
+  // expected-error @+1 {{offsets must have the same rank as input}}
+  %view = ttg.memdesc_subslice %src[%row] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>
+  tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+tt.func @dynamic_subslice_allocation_shape(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %row: i32) {
+  // expected-error @+1 {{source and result must have the same allocation shape}}
+  %view = ttg.memdesc_subslice %src[%row, 0] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf32, #shared, #smem>
+  tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+tt.func @dynamic_subslice_mutability(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %row: i32) {
+  // expected-error @+1 {{source and result must have the same mutability}}
+  %view = ttg.memdesc_subslice %src[%row, 0] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf32, #shared, #smem, mutable, 8x16>
+  tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+tt.func @dynamic_subslice_known_out_of_bounds(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %column: i32) {
+  %eight = arith.constant 8 : i32
+  // expected-error @+1 {{The split offset may not exceed the source shape}}
+  %view = ttg.memdesc_subslice %src[%eight, %column] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x8xf32, #shared, #smem, 8x16>
+  tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+tt.func @dynamic_subslice_known_unaligned(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %column: i32) {
+  %two = arith.constant 2 : i32
+  // expected-error @+1 {{The split offset may not touch the tile}}
+  %view = ttg.memdesc_subslice %src[%two, %column] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x8xf32, #shared, #smem, 8x16>
+  tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+tt.func @dynamic_subslice_known_unsplit_offset(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %row: i32) {
+  %one = arith.constant 1 : i32
+  // expected-error @+1 {{A non zero offset found in a dimension that is not being split}}
+  %view = ttg.memdesc_subslice %src[%row, %one] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>
+  tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+tt.func @dynamic_subslice_cannot_grow_source_view(%src: !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>, %row: i32) {
+  // expected-error @+1 {{result dimensions must not exceed the source shape}}
+  %view = ttg.memdesc_subslice %src[%row, 0] : !ttg.memdesc<4x16xf32, #shared, #smem, 8x16> -> !ttg.memdesc<8x16xf32, #shared, #smem>
+  tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 16, order = [0, 1]}>
+#smem = #ttg.shared_memory
+tt.func @dynamic_subslice_swizzling_pattern(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %column: i32) {
+  // expected-error @+1 {{We don't support splitting along the swizzling pattern}}
+  %view = ttg.memdesc_subslice %src[0, %column] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<8x4xf32, #shared, #smem, 8x16>
+  tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
+  tt.func @dynamic_subslice_multi_cta(%src: !ttg.memdesc<4x32xi32, #shared, #smem>, %row: i32) {
+    // expected-error @+1 {{dynamic subslicing requires a single-CTA kernel}}
+    %view = ttg.memdesc_subslice %src[%row, 0] : !ttg.memdesc<4x32xi32, #shared, #smem> -> !ttg.memdesc<2x32xi32, #shared, #smem, 4x32>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+tt.func @subslice_missing_dynamic_offset(%src: !ttg.memdesc<8x16xf32, #shared, #smem>) {
+  // expected-error @+1 {{expected 1 dynamic offsets}}
+  %view = "ttg.memdesc_subslice"(%src) {offsets = array<i64: -9223372036854775808, 0>} : (!ttg.memdesc<8x16xf32, #shared, #smem>) -> !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>
+  tt.return
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+tt.func @subslice_wrong_dynamic_offset_type(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %row: i64) {
+  // expected-error @+1 {{operand #1 must be variadic of 32-bit signless integer}}
+  %view = "ttg.memdesc_subslice"(%src, %row) {offsets = array<i64: -9223372036854775808, 0>} : (!ttg.memdesc<8x16xf32, #shared, #smem>, i64) -> !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>
+  tt.return
+}

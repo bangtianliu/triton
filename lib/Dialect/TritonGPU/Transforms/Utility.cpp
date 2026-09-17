@@ -1583,8 +1583,9 @@ void replaceUsesAndPropagateType(
       Type newDstType = ttg::MemDescType::get(
           oldType.getShape(), oldType.getElementType(), oldType.getEncoding(),
           oldType.getMemorySpace(), isMutable, oldType.getAllocShape());
-      newVal = ttg::MemDescSubsliceOp::create(
-          builder, subslice.getLoc(), newDstType, val, subslice.getOffsets());
+      newVal =
+          ttg::MemDescSubsliceOp::create(builder, subslice.getLoc(), newDstType,
+                                         val, subslice.getMixedOffsets());
     } else if (auto trans = dyn_cast<ttg::MemDescTransOp>(user)) {
       newVal = ttg::MemDescTransOp::create(builder, trans.getLoc(), val,
                                            trans.getOrder());

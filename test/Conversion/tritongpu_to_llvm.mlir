@@ -3722,3 +3722,41 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @dynamic_subslice_nested_offsets
+  tt.func private @dynamic_subslice_nested_offsets(%src: !ttg.memdesc<128xi32, #shared, #smem>, %outer: i32, %inner: i32) -> !ttg.memdesc<16xi32, #shared, #smem, 128> {
+    %base = ttg.memdesc_subslice %src[64] : !ttg.memdesc<128xi32, #shared, #smem> -> !ttg.memdesc<64xi32, #shared, #smem, 128>
+    // CHECK: llvm.add %{{.*}}, %arg1 : i32
+    %first = ttg.memdesc_subslice %base[%outer] : !ttg.memdesc<64xi32, #shared, #smem, 128> -> !ttg.memdesc<32xi32, #shared, #smem, 128>
+    // CHECK: %[[OFFSET:.*]] = llvm.add %{{.*}}, %arg2 : i32
+    // CHECK: llvm.insertvalue %[[OFFSET]], %{{.*}}[1]
+    %second = ttg.memdesc_subslice %first[%inner] : !ttg.memdesc<32xi32, #shared, #smem, 128> -> !ttg.memdesc<16xi32, #shared, #smem, 128>
+    // CHECK: llvm.return
+    tt.return %second : !ttg.memdesc<16xi32, #shared, #smem, 128>
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 2, perPhase = 2, maxPhase = 4, order = [1, 0]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @dynamic_subslice_pipeline_prefix
+  tt.func private @dynamic_subslice_pipeline_prefix(%src: !ttg.memdesc<7x16x16xf16, #shared, #smem>, %stage: i32, %index: i32, %row: i32) -> !ttg.memdesc<8x16xf16, #shared, #smem, 16x16> {
+    // CHECK: %[[STRIDE:.*]] = llvm.mlir.constant(256 : i32)
+    // CHECK: %[[PREFIX:.*]] = llvm.mul %arg1, %[[STRIDE]] : i32
+    // CHECK: llvm.getelementptr %{{.*}}[%[[PREFIX]]]
+    %prefix = ttg.memdesc_subslice %src[%stage, 0, 0] : !ttg.memdesc<7x16x16xf16, #shared, #smem> -> !ttg.memdesc<3x16x16xf16, #shared, #smem, 7x16x16>
+    // CHECK: %[[INDEX:.*]] = llvm.mul %arg2, %{{.*}} : i32
+    // CHECK: llvm.getelementptr %{{.*}}[%[[INDEX]]]
+    %buffer = ttg.memdesc_index %prefix[%index] : !ttg.memdesc<3x16x16xf16, #shared, #smem, 7x16x16> -> !ttg.memdesc<16x16xf16, #shared, #smem>
+    // CHECK: llvm.add %{{.*}}, %arg3 : i32
+    %view = ttg.memdesc_subslice %buffer[%row, 0] : !ttg.memdesc<16x16xf16, #shared, #smem> -> !ttg.memdesc<8x16xf16, #shared, #smem, 16x16>
+    tt.return %view : !ttg.memdesc<8x16xf16, #shared, #smem, 16x16>
+  }
+}

@@ -925,9 +925,17 @@ void init_gluon_ir(py::module_ &m) {
            })
       .def("create_memdesc_subslice",
            [](GluonOpBuilder &self, Type resultType, Value src,
-              std::vector<int32_t> &offsets) -> Value {
+              py::list offsets) -> Value {
+             SmallVector<OpFoldResult> mixedOffsets;
+             for (py::handle offset : offsets) {
+               if (py::isinstance<py::int_>(offset))
+                 mixedOffsets.push_back(self.getBuilder().getI64IntegerAttr(
+                     py::cast<int64_t>(offset)));
+               else
+                 mixedOffsets.push_back(py::cast<Value>(offset));
+             }
              return self.create<ttg::MemDescSubsliceOp>(resultType, src,
-                                                        offsets);
+                                                        mixedOffsets);
            })
       .def("create_memdesc_trans",
            [](GluonOpBuilder &self, Value src,
