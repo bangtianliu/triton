@@ -536,6 +536,51 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, ttg.targ
 """)
 
 
+@gluon.jit(do_not_specialize=["stage", "row", "col"])
+def shared_memory_dynamic_slice_kernel(stage, row, col, layout: ttgl.constexpr):
+    # CHECK: ttg.local_alloc
+    smem = ttgl.allocate_shared_memory(ttgl.int32, [2, 8, 64], ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
+    # CHECK: ttg.memdesc_index
+    tile = smem.index(stage)
+    # CHECK: ttg.memdesc_subslice {{.*}}[%{{.*}}, 0] {{.*}} -> !ttg.memdesc<1x64xi32, #shared, #smem, mutable, 8x64>
+    row_view = tile.slice(row, 1)
+    # CHECK: ttg.memdesc_subslice {{.*}}[0, %{{.*}}] {{.*}} -> !ttg.memdesc<1x32xi32, #shared, #smem, mutable, 8x64>
+    view = row_view.slice(col, 32, dim=1)
+    ttgl.static_assert(view.shape == [1, 32])
+    ttgl.static_assert(view.type.alloc_shape == [8, 64])
+    ttgl.static_assert(view.layout == tile.layout)
+    # CHECK: ttg.local_load
+    return view.load(layout)
+
+
+@pytest.mark.parametrize("target", ALL_TARGETS + [HIP_TARGET_CDNA4])
+def test_shared_memory_dynamic_slice(target):
+    layout = ttgl.BlockedLayout([1, 1], [1, target.warp_size], [4, 1], [1, 0])
+    run_filecheck_test(shared_memory_dynamic_slice_kernel, *make_args(1, 5, 32, layout), target=target)
+
+
+@pytest.mark.parametrize("kind", ["float", "int64", "vector", "length", "dim"])
+def test_shared_memory_dynamic_slice_invalid_argument(kind):
+
+    @gluon.jit(do_not_specialize=["start"])
+    def kernel(start, KIND: ttgl.constexpr):
+        smem = ttgl.allocate_shared_memory(ttgl.int32, [8, 64], ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
+        if KIND == "float":
+            smem.slice(start.to(ttgl.float32), 1)
+        elif KIND == "int64":
+            smem.slice(start.to(ttgl.int64), 1)
+        elif KIND == "vector":
+            smem.slice(ttgl.full([1], start, ttgl.int32, ttgl.BlockedLayout([1], [32], [4], [0])), 1)
+        elif KIND == "length":
+            smem.slice(start, start)
+        else:
+            smem.slice(start, 1, dim=start)
+
+    message = f"expected '{kind}' to be an int" if kind in ("length", "dim") else "expected 'start' to be int32"
+    with pytest.raises(CompilationError, match=message):
+        run_parser(kernel, *make_args(2, kind))
+
+
 @gluon.jit
 def shared_memory_index_kernel(XBLOCK: ttgl.constexpr, layout: ttgl.constexpr, smem_layout: ttgl.constexpr):
     smem = ttgl.allocate_shared_memory(ttgl.int32, [4, XBLOCK], smem_layout)

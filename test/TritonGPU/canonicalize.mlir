@@ -398,6 +398,100 @@ tt.func @fold_subslice_chain() {
 
 // -----
 
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#smem = #ttg.shared_memory
+
+// CHECK-LABEL: @subslice_mixed_offsets
+tt.func @subslice_mixed_offsets(%src: !ttg.memdesc<32x64xf32, #shared, #smem>, %column: i32) -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64> {
+  // CHECK: %[[VIEW:.*]] = ttg.memdesc_subslice %arg0[16, %arg1]
+  %view = ttg.memdesc_subslice %src[16, %column] : !ttg.memdesc<32x64xf32, #shared, #smem> -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+  // CHECK-NEXT: tt.return %[[VIEW]]
+  tt.return %view : !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+}
+
+// CHECK-LABEL: @fold_subslice_constant_row
+tt.func @fold_subslice_constant_row(%src: !ttg.memdesc<32x64xf32, #shared, #smem>, %column: i32) -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64> {
+  %row = arith.constant 16 : i32
+  // CHECK-NOT: arith.constant
+  // CHECK: %[[VIEW:.*]] = ttg.memdesc_subslice %arg0[16, %arg1]
+  %view = ttg.memdesc_subslice %src[%row, %column] : !ttg.memdesc<32x64xf32, #shared, #smem> -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+  // CHECK-NEXT: tt.return %[[VIEW]]
+  tt.return %view : !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+}
+
+// CHECK-LABEL: @fold_subslice_constant_offsets
+tt.func @fold_subslice_constant_offsets(%src: !ttg.memdesc<32x64xf32, #shared, #smem>) -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64> {
+  %row = arith.constant 16 : i32
+  %column = arith.constant 32 : i32
+  // CHECK-NOT: arith.constant
+  // CHECK: %[[VIEW:.*]] = ttg.memdesc_subslice %arg0[16, 32]
+  %view = ttg.memdesc_subslice %src[%row, %column] : !ttg.memdesc<32x64xf32, #shared, #smem> -> !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+  // CHECK-NEXT: tt.return %[[VIEW]]
+  tt.return %view : !ttg.memdesc<16x32xf32, #shared, #smem, 32x64>
+}
+
+// CHECK-LABEL: @preserve_subslice_runtime_parent
+tt.func @preserve_subslice_runtime_parent(%src: !ttg.memdesc<32x64xf32, #shared, #smem>, %row: i32) -> !ttg.memdesc<8x32xf32, #shared, #smem, 32x64> {
+  // CHECK: %[[PARENT:.*]] = ttg.memdesc_subslice %arg0[%arg1, 0]
+  %parent = ttg.memdesc_subslice %src[%row, 0] : !ttg.memdesc<32x64xf32, #shared, #smem> -> !ttg.memdesc<16x64xf32, #shared, #smem, 32x64>
+  // CHECK-NEXT: %[[CHILD:.*]] = ttg.memdesc_subslice %[[PARENT]][8, 32]
+  %child = ttg.memdesc_subslice %parent[8, 32] : !ttg.memdesc<16x64xf32, #shared, #smem, 32x64> -> !ttg.memdesc<8x32xf32, #shared, #smem, 32x64>
+  // CHECK-NEXT: tt.return %[[CHILD]]
+  tt.return %child : !ttg.memdesc<8x32xf32, #shared, #smem, 32x64>
+}
+
+// CHECK-LABEL: @fold_subslice_poison_offsets
+tt.func @fold_subslice_poison_offsets(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %selector: i32) -> !ttg.memdesc<2x16xf32, #shared, #smem, 8x16> {
+  %zero = arith.constant 0 : i32
+  %one = arith.constant 1 : i32
+  // The invalid offsets are never executed, but canonicalization visits the
+  // branch and must preserve valid IR when their arithmetic folds to constants.
+  %positive = arith.cmpi sgt, %selector, %zero : i32
+  %negative = arith.cmpi slt, %selector, %zero : i32
+  %unreachable = arith.andi %positive, %negative : i1
+  // CHECK: scf.if
+  %result = scf.if %unreachable -> (!ttg.memdesc<2x16xf32, #shared, #smem, 8x16>) {
+    %two = arith.addi %one, %one : i32
+    %four = arith.addi %two, %two : i32
+    %column = arith.subi %two, %one : i32
+    %column_zero = arith.subi %one, %one : i32
+    // CHECK-NEXT: %[[VIEW:.*]] = ttg.memdesc_subslice %arg0[6, 1]
+    %unaligned = ttg.memdesc_subslice %src[%two, %column_zero] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>
+    %out_of_bounds = ttg.memdesc_subslice %unaligned[%four, 0] : !ttg.memdesc<4x16xf32, #shared, #smem, 8x16> -> !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+    %unsplit = ttg.memdesc_subslice %out_of_bounds[0, %column] : !ttg.memdesc<2x16xf32, #shared, #smem, 8x16> -> !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+    // CHECK-NEXT: scf.yield %[[VIEW]]
+    scf.yield %unsplit : !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+  } else {
+    %valid = ttg.memdesc_subslice %src[0, 0] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+    scf.yield %valid : !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+  }
+  tt.return %result : !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+}
+
+// CHECK-LABEL: @preserve_subslice_offset_overflow
+tt.func @preserve_subslice_offset_overflow(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %selector: i32) -> !ttg.memdesc<2x16xf32, #shared, #smem, 8x16> {
+  %zero = arith.constant 0 : i32
+  %positive = arith.cmpi sgt, %selector, %zero : i32
+  %negative = arith.cmpi slt, %selector, %zero : i32
+  %unreachable = arith.andi %positive, %negative : i1
+  // Composition must not create an offset outside the i32 attribute domain.
+  // CHECK: scf.if
+  %result = scf.if %unreachable -> (!ttg.memdesc<2x16xf32, #shared, #smem, 8x16>) {
+    // CHECK-NEXT: %[[PARENT:.*]] = ttg.memdesc_subslice %arg0[2147483647, 0]
+    %parent = ttg.memdesc_subslice %src[2147483647, 0] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>
+    // CHECK-NEXT: %[[CHILD:.*]] = ttg.memdesc_subslice %[[PARENT]][1, 0]
+    %child = ttg.memdesc_subslice %parent[1, 0] : !ttg.memdesc<4x16xf32, #shared, #smem, 8x16> -> !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+    // CHECK-NEXT: scf.yield %[[CHILD]]
+    scf.yield %child : !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+  } else {
+    %valid = ttg.memdesc_subslice %src[0, 0] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+    scf.yield %valid : !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+  }
+  tt.return %result : !ttg.memdesc<2x16xf32, #shared, #smem, 8x16>
+}
+
+// -----
+
 #src = #ttg.blocked<{sizePerThread = [1], threadsPerWarp = [32], warpsPerCTA = [4], order = [0]}>
 #parent = #ttg.blocked<{sizePerThread = [1, 1], threadsPerWarp = [1, 32], warpsPerCTA = [1, 4], order = [1, 0]}>
 #slice = #ttg.slice<{dim = 0, parent = #parent}>

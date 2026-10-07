@@ -1259,6 +1259,16 @@ struct AsyncCopyLocalToGlobalOpConversion
   }
 };
 
+SmallVector<Value> getTDMBasePointers(Location loc, RewriterBase &rewriter,
+                                      MemDescType type,
+                                      const LLVM::SharedMemoryObject &smemObj) {
+  if (!LLVM::SharedMemoryObject::isAffineSharedMemoryAccess(type))
+    return llvm::to_vector(smemObj.getBases());
+  // The verifier restricts TDM subviews to contiguous, unpadded tiles with a
+  // single base, so their logical origin is an additive displacement.
+  return {smemObj.getShmemAffineBase(loc, rewriter, type)};
+}
+
 struct AsyncTDMCopyGlobalToLocalOpConversion
     : public ConvertOpToLLVMPattern<
           triton::amdgpu::AsyncTDMCopyGlobalToLocalOp>,
@@ -1315,7 +1325,8 @@ struct AsyncTDMCopyGlobalToLocalOpConversion
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getResult(), elementType, rewriter);
     // Get all base pointers (multiple for partitioned encoding)
-    SmallVector<Value> dstPtrs = llvm::to_vector(dstMemObj.getBases());
+    SmallVector<Value> dstPtrs =
+        getTDMBasePointers(loc, rewriter, op.getResult().getType(), dstMemObj);
     // Positioning lives in the descriptor; the copy only does per-warp
     // distribution, so the user offset is zero.
     SmallVector<Value> offset(blockShape.size(), b.i32_val(0));
@@ -1407,7 +1418,9 @@ struct AsyncTDMFusedCopyGlobalToLocalOpConversion
 
       auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
           loc, adaptor.getDests()[i], m.elementType, rewriter);
-      m.dstPtrs = llvm::to_vector(dstMemObj.getBases());
+      m.dstPtrs = getTDMBasePointers(
+          loc, rewriter, cast<MemDescType>(op.getDests()[i].getType()),
+          dstMemObj);
       m.pred = Value();
       memberHints.push_back(static_cast<uint32_t>(op.getWarpUsedHints()[i]));
     }
@@ -1457,7 +1470,8 @@ struct AsyncTDMCopyLocalToGlobalOpConversion
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getSrc(), elementType, rewriter);
     // Get all base pointers (multiple for partitioned encoding)
-    SmallVector<Value> srcPtrs = llvm::to_vector(dstMemObj.getBases());
+    SmallVector<Value> srcPtrs =
+        getTDMBasePointers(loc, rewriter, smemTy, dstMemObj);
     // Positioning lives in the descriptor; the copy only does per-warp
     // distribution, so the user offset is zero.
     SmallVector<Value> offset(blockShape.size(), b.i32_val(0));
@@ -1543,7 +1557,7 @@ struct AsyncTDMScatterOpConversion
 
     auto srcMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getSrc(), elementType, rewriter);
-    Value srcPtr = srcMemObj.getBase();
+    Value srcPtr = getTDMBasePointers(loc, rewriter, smemTy, srcMemObj).front();
 
     Value barrierPtr = nullptr;
     if (op.getBarrier()) {
@@ -1635,7 +1649,7 @@ struct AsyncTDMGatherOpConversion
 
     auto dstMemObj = LLVM::getSharedMemoryObjectFromStruct(
         loc, adaptor.getDst(), elementType, rewriter);
-    Value dstPtr = dstMemObj.getBase();
+    Value dstPtr = getTDMBasePointers(loc, rewriter, smemTy, dstMemObj).front();
 
     Value barrierPtr = nullptr;
     if (op.getBarrier()) {

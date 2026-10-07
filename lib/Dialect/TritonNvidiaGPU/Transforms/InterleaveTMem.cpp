@@ -77,8 +77,14 @@ findBufferAccessMemdescSubview(Operation *subview) {
     auto subsliceOp = cast<ttg::MemDescSubsliceOp>(subview);
     src = subsliceOp.getSrc();
     shape = to_vector(subsliceOp.getType().getShape());
-    for (auto offset : subsliceOp.getOffsets())
-      offsets.push_back(arith::ConstantIntOp::create(builder, loc, offset, 32));
+    for (OpFoldResult offset : subsliceOp.getMixedOffsets()) {
+      if (auto value = dyn_cast<Value>(offset))
+        offsets.push_back(value);
+      else
+        offsets.push_back(arith::ConstantIntOp::create(
+            builder, loc, cast<IntegerAttr>(cast<Attribute>(offset)).getInt(),
+            32));
+    }
   }
   auto [alloc, parentAccess] = findBufferAccess(src);
   if (!alloc)

@@ -3399,3 +3399,103 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [16, 16]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, ttg.shared = 1152 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32} {
+  // CHECK-LABEL: @dynamic_subslice_padded_state
+  tt.func public @dynamic_subslice_padded_state(%column: i32) {
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<16x16xf32, #shared, #smem, mutable>
+    %lower = ttg.memdesc_subslice %alloc [0, 0] : !ttg.memdesc<16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
+    %upper = ttg.memdesc_subslice %alloc [8, 0] : !ttg.memdesc<16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16>
+    // Every runtime candidate has its own state lane, disjoint from %lower.
+    // CHECK: arith.constant dense<[true, false, false, false]> : tensor<4xi1
+    // CHECK: ttg.local_load
+    %0 = ttg.local_load %lower : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16> -> tensor<8x8xf32>
+    %dynamic = ttg.memdesc_subslice %upper[0, %column] : !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16> -> !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
+    // CHECK: %[[DYNAMIC_BASE:.*]] = tti.experimental_memdesc_to_i32
+    // CHECK-DAG: %[[LEFT:.*]] = tti.experimental_memory_offset_to_i32 576, shared_mem
+    // CHECK-DAG: %[[RIGHT:.*]] = tti.experimental_memory_offset_to_i32 608, shared_mem
+    // CHECK-DAG: arith.cmpi eq, %[[DYNAMIC_BASE]], %[[LEFT]]
+    // CHECK-DAG: arith.cmpi eq, %[[DYNAMIC_BASE]], %[[RIGHT]]
+    // CHECK: tti.experimental_assert_uniform {{.*}}, "internal ConSan error: active memdesc resolved to no buffer state"
+    // CHECK-DAG: arith.constant dense<[false, true, false, false]> : tensor<4xi1
+    // CHECK-DAG: arith.constant dense<[false, false, true, false]> : tensor<4xi1
+    // CHECK: ttg.local_load
+    %1 = ttg.local_load %dynamic : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16> -> tensor<8x8xf32>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32, ttg.shared = 256 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32} {
+  // CHECK-LABEL: @dynamic_subslice_nested_barrier_state
+  tt.func public @dynamic_subslice_nested_barrier_state(%outer_raw: i32, %inner_raw: i32) {
+    // The 17 x 16 offset combinations resolve to 32 distinct barriers.
+    // CHECK: tti.experimental_buffer_descriptors [0, 8, {{.*}}, 248], [8, 8, {{.*}}, 8], shared_mem : tensor<32xi64,
+    %c0 = arith.constant 0 : i32
+    %c15 = arith.constant 15 : i32
+    %c17 = arith.constant 17 : i32
+    %true = arith.constant true
+    %outer = arith.remui %outer_raw, %c17 : i32
+    %inner = arith.andi %inner_raw, %c15 : i32
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<32x1xi64, #shared, #smem, mutable>
+    // CHECK: %[[WINDOW:.*]] = ttg.memdesc_subslice
+    %window = ttg.memdesc_subslice %alloc[%outer, 0] : !ttg.memdesc<32x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<16x1xi64, #shared, #smem, mutable, 32x1>
+    // CHECK: %[[SLOT:.*]] = ttg.memdesc_subslice %[[WINDOW]]
+    %slot = ttg.memdesc_subslice %window[%inner, 0] : !ttg.memdesc<16x1xi64, #shared, #smem, mutable, 32x1> -> !ttg.memdesc<1x1xi64, #shared, #smem, mutable, 32x1>
+    // CHECK: %[[NESTED_BARRIER:.*]] = ttg.memdesc_index %[[SLOT]]
+    %bar = ttg.memdesc_index %slot[%c0] : !ttg.memdesc<1x1xi64, #shared, #smem, mutable, 32x1> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: tt.call @__triton_consan_verify_barrier_can_init
+    // CHECK: tt.call @__triton_consan_init_barrier_state
+    // CHECK: ttng.init_barrier %[[NESTED_BARRIER]]
+    ttng.init_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: tt.call @__triton_consan_verify_and_update_barrier_state
+    // CHECK: ttng.arrive_barrier %[[NESTED_BARRIER]]
+    ttng.arrive_barrier %bar, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: tt.call @__triton_consan_verify_barrier_initialized
+    // CHECK: ttng.wait_barrier %[[NESTED_BARRIER]]
+    // CHECK: tt.call @__triton_consan_clear_waiting
+    ttng.wait_barrier %bar, %c0, %true : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    // CHECK: tt.call @__triton_consan_invalidate_barrier_state
+    // CHECK: ttng.inval_barrier %[[NESTED_BARRIER]]
+    ttng.inval_barrier %bar : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32, ttg.shared = 2048 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32} {
+  // CHECK-LABEL: @dynamic_subslice_many_origins_select_state
+  tt.func public @dynamic_subslice_many_origins_select_state(%raw: i32, %choose: i1, %input: tensor<512xi32>) -> tensor<1xi32> {
+    %c511 = arith.constant 511 : i32
+    %offset = arith.andi %raw, %c511 : i32
+    %alloc = ttg.local_alloc %input {allocation.offset = 0 : i32} : (tensor<512xi32>) -> !ttg.memdesc<512xi32, #shared, #smem, mutable>
+    %dynamic = ttg.memdesc_subslice %alloc[%offset] : !ttg.memdesc<512xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 512>
+    %known = ttg.memdesc_subslice %alloc[0] : !ttg.memdesc<512xi32, #shared, #smem, mutable> -> !ttg.memdesc<1xi32, #shared, #smem, mutable, 512>
+    // CHECK: %[[SELECTED:.*]] = arith.select {{.*}} : !ttg.memdesc<1xi32
+    %selected = arith.select %choose, %dynamic, %known : !ttg.memdesc<1xi32, #shared, #smem, mutable, 512>
+    // CHECK: %[[SELECTED_BASE:.*]] = tti.experimental_memdesc_to_i32 %[[SELECTED]]
+    // CHECK: %[[FIRST_BASE:.*]] = tti.experimental_memory_offset_to_i32 0, shared_mem
+    // CHECK: arith.cmpi eq, %[[SELECTED_BASE]], %[[FIRST_BASE]]
+    // CHECK: %[[LAST_BASE:.*]] = tti.experimental_memory_offset_to_i32 2044, shared_mem
+    // CHECK: arith.cmpi eq, %[[SELECTED_BASE]], %[[LAST_BASE]]
+    // CHECK: tti.experimental_assert_uniform {{.*}}, "internal ConSan error: active memdesc resolved to no buffer state"
+    // CHECK: tt.call @__triton_consan_verify_write_visibility
+    // CHECK: tt.call @__triton_consan_set_read_visibility_nw1_I32_
+    // CHECK: ttg.local_load %[[SELECTED]]
+    %result = ttg.local_load %selected : !ttg.memdesc<1xi32, #shared, #smem, mutable, 512> -> tensor<1xi32>
+    tt.return %result : tensor<1xi32>
+  }
+}

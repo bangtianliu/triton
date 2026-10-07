@@ -2931,6 +2931,63 @@ def test_proxy_fence_nested_multibuffer_prefix(fresh_knobs):
     torch.testing.assert_close(output, values, atol=0, rtol=0)
 
 
+@pytest.mark.parametrize("start", [0, 3])
+def test_shared_dynamic_slice_row(start, device):
+    warp_size = ttgl.constexpr(THREADS_PER_WARP)
+
+    @gluon.jit(do_not_specialize=["start", "n_iters"])
+    def kernel(out, start, n_iters):
+        layout: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [1, warp_size], [4, 1], [1, 0])
+        rows = ttgl.arange(0, 8, layout=ttgl.SliceLayout(1, layout))[:, None]
+        cols = ttgl.arange(0, 64, layout=ttgl.SliceLayout(0, layout))[None, :]
+        smem = ttgl.allocate_shared_memory(ttgl.int32, [2, 8, 64], ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
+        for stage in ttgl.static_range(2):
+            smem.index(stage).store(stage * 512 + rows * 64 + cols)
+        for i in range(n_iters):
+            row = smem.index(i % 2).slice((start + 3 * i) % 8, 1)
+            values = row.load(layout).reshape([64])
+            offsets = ttgl.arange(0, 64, layout=values.type.layout)
+            ttgl.store(out + i * 64 + offsets, values)
+
+    n_iters = 8
+    output = torch.empty((n_iters, 64), dtype=torch.int32, device=device)
+    kernel[(1, )](output, start, n_iters)
+    i = torch.arange(n_iters, device=device)[:, None]
+    expected = (i % 2) * 512 + ((start + 3 * i) % 8) * 64 + torch.arange(64, device=device)[None, :]
+    torch.testing.assert_close(output, expected.to(torch.int32))
+
+
+@pytest.mark.parametrize("swizzled", [False, True])
+@pytest.mark.parametrize("row_start, col_start", [(0, 0), (16, 32)])
+def test_shared_dynamic_slice_nested(swizzled, row_start, col_start, device):
+    warp_size = ttgl.constexpr(THREADS_PER_WARP)
+    shared_layout = ttgl.SwizzledSharedLayout(4, 1, 4 if swizzled else 1, [1, 0])
+
+    @gluon.jit(do_not_specialize=["prefix", "stage", "row_start", "col_start"])
+    def kernel(out, prefix, stage, row_start, col_start, SHARED: ttgl.constexpr):
+        writer: ttgl.constexpr = ttgl.BlockedLayout([1, 4], [1, warp_size], [4, 1], [1, 0])
+        reader: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [warp_size, 1], [1, 4], [0, 1])
+        rows = ttgl.arange(0, 32, layout=ttgl.SliceLayout(1, writer))[:, None]
+        cols = ttgl.arange(0, 64, layout=ttgl.SliceLayout(0, writer))[None, :]
+        smem = ttgl.allocate_shared_memory(ttgl.int32, [4, 32, 64], SHARED)
+        for s in ttgl.static_range(4):
+            smem.index(s).store(s * 2048 + rows * 64 + cols)
+        tile = smem.slice(prefix, 2).index(stage)
+        view = tile.slice(row_start, 16).slice(8, 8)
+        view = view.slice(col_start, 32, dim=1).slice(16, 16, dim=1)
+        view.store(view.load(reader) + 100000)
+        out_rows = ttgl.arange(0, 32, layout=ttgl.SliceLayout(1, reader))[:, None]
+        out_cols = ttgl.arange(0, 64, layout=ttgl.SliceLayout(0, reader))[None, :]
+        for s in ttgl.static_range(4):
+            ttgl.store(out + s * 2048 + out_rows * 64 + out_cols, smem.index(s).load(reader))
+
+    output = torch.empty((4, 32, 64), dtype=torch.int32, device=device)
+    kernel[(1, )](output, 1, 1, row_start, col_start, shared_layout)
+    expected = torch.arange(4 * 32 * 64, dtype=torch.int32, device=device).reshape(4, 32, 64)
+    expected[2, row_start + 8:row_start + 16, col_start + 16:col_start + 32] += 100000
+    torch.testing.assert_close(output, expected)
+
+
 def test_slice_reinterpret():
     BLOCK = ttgl.constexpr(2048)
     SPLIT_BLOCK = ttgl.constexpr(BLOCK // 2)
@@ -3135,7 +3192,9 @@ def test_inline_with_amdgpu_dialect():
      {"offsets": [[0, 1], [0, 2], [0, 8], [0, 4], [0, 16], [0, 32], [2, 0], [1, 0], [4, 0], [8, 0], [16, 0], [32, 0]]}])
 @pytest.mark.parametrize("slice_m_offset, slice_n_offset, slice_m, slice_n", [(48, 16, 16, 16), (32, 48, 32, 16),
                                                                               (48, 32, 16, 32)])
-def test_padded_shared_layout_subslice(interval_pairs, shared_layout, slice_m_offset, slice_n_offset, slice_m, slice_n):
+@pytest.mark.parametrize("dynamic", [False, True])
+def test_padded_shared_layout_subslice(interval_pairs, shared_layout, slice_m_offset, slice_n_offset, slice_m, slice_n,
+                                       dynamic):
     m = 64
     n = 64
     num_warps = 1
@@ -3151,9 +3210,9 @@ def test_padded_shared_layout_subslice(interval_pairs, shared_layout, slice_m_of
         blocks = []
         smem_layout = ttgl.constexpr(ttgl.PaddedSharedLayout(interval_pairs, offsets, blocks, shape))
 
-    @gluon.jit
-    def kernel(in_ptr, out_ptr, M: ttgl.constexpr, N: ttgl.constexpr, SLICE_M_OFFSET: ttgl.constexpr,
-               SLICE_N_OFFSET: ttgl.constexpr, SLICE_M: ttgl.constexpr, SLICE_N: ttgl.constexpr):
+    @gluon.jit(do_not_specialize=["SLICE_M_OFFSET", "SLICE_N_OFFSET"])
+    def kernel(in_ptr, out_ptr, M: ttgl.constexpr, N: ttgl.constexpr, SLICE_M_OFFSET, SLICE_N_OFFSET,
+               SLICE_M: ttgl.constexpr, SLICE_N: ttgl.constexpr):
         blocked: ttgl.constexpr = ttgl.BlockedLayout([1, 1], [warp_size_cst, 1], [1, num_warps_cst], [1, 0])
         offs_m_load = ttgl.arange(0, M, ttgl.SliceLayout(1, blocked))
         offs_n_load = ttgl.arange(0, N, ttgl.SliceLayout(0, blocked))
@@ -3178,7 +3237,9 @@ def test_padded_shared_layout_subslice(interval_pairs, shared_layout, slice_m_of
     output = torch.zeros((slice_m, slice_n), dtype=torch.int32, device="cuda")
     ref_output = input[slice_m_offset:slice_m_offset + slice_m, slice_n_offset:slice_n_offset + slice_n]
 
-    kernel[(1, )](input, output, m, n, slice_m_offset, slice_n_offset, slice_m, slice_n, num_warps=num_warps)
+    offset_m = slice_m_offset if dynamic else ttgl.constexpr(slice_m_offset)
+    offset_n = slice_n_offset if dynamic else ttgl.constexpr(slice_n_offset)
+    kernel[(1, )](input, output, m, n, offset_m, offset_n, slice_m, slice_n, num_warps=num_warps)
 
     assert (output == ref_output).all()
 

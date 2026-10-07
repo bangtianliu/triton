@@ -1518,6 +1518,74 @@ def test_tma_overlapping_operations(OP, SYNCHRONIZED, device, run_wrapper, monke
         torch.testing.assert_close(output, input)
 
 
+@pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9, reason="Requires Hopper or newer")
+@pytest.mark.parametrize("overlap, wait", [(False, False), (True, True), (True, False)])
+def test_dynamic_slice_async_copy(overlap, wait, device, run_wrapper, monkeypatch):
+    if run_wrapper:
+        result = run_in_process(test_dynamic_slice_async_copy, (overlap, wait, device, False, monkeypatch))
+        if overlap and not wait:
+            assert_expected_cuda_failure(result.exc)
+            assert "Pending access type: async_copy_global_to_shared" in result.driver_stderr_output
+        else:
+            assert result.exc is None
+            assert result.driver_stderr_output == ""
+        return
+
+    monkeypatch.setenv("TRITON_INSTRUMENTATION_MODE", "consan")
+    monkeypatch.setenv("CUDA_LAUNCH_BLOCKING", "1")
+    knobs.refresh_knobs()
+
+    @gluon.jit(do_not_specialize=["offset"])
+    def kernel(input, output, offset, OVERLAP: ttgl.constexpr, WAIT: ttgl.constexpr):
+        layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])
+        smem = ttgl.allocate_shared_memory(ttgl.int32, [1024], ttgl.SwizzledSharedLayout(1, 1, 1, [0]))
+        left = smem.slice(0, 512)
+        right = smem.slice(512, 512)
+        left.store(ttgl.full([512], 7, ttgl.int32, layout))
+        ampere.async_copy.async_load(right, input + ttgl.arange(0, 512, layout=layout))
+        ampere.async_copy.commit_group()
+        if WAIT:
+            ampere.async_copy.wait_group(0)
+        source = right if OVERLAP else left
+        value = source.slice(offset, 128).load(layout)
+        ttgl.store(output + ttgl.arange(0, 128, layout=layout), value)
+        ampere.async_copy.wait_group(0)
+        smem._keep_alive()
+
+    data = torch.arange(512, device=device, dtype=torch.int32)
+    output = torch.empty(128, device=device, dtype=torch.int32)
+    kernel[(1, )](data, output, 256, overlap, wait)
+    if wait or not overlap:
+        expected = data[256:384] if overlap else torch.full_like(output, 7)
+        torch.testing.assert_close(output, expected)
+
+
+@pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9, reason="Requires Hopper or newer")
+def test_dynamic_slice_padded(device, run_wrapper, monkeypatch):
+    if run_wrapper:
+        result = run_in_process(test_dynamic_slice_padded, (device, False, monkeypatch))
+        assert result.exc is None
+        assert result.driver_stderr_output == ""
+        return
+
+    monkeypatch.setenv("TRITON_INSTRUMENTATION_MODE", "consan")
+    knobs.refresh_knobs()
+
+    @gluon.jit(do_not_specialize=["offset"])
+    def kernel(input, output, offset):
+        layout: ttgl.constexpr = ttgl.BlockedLayout([1], [32], [4], [0])
+        shared: ttgl.constexpr = ttgl.PaddedSharedLayout.with_identity_for([[128, 16]], [512], [0])
+        values = ttgl.load(input + ttgl.arange(0, 512, layout=layout))
+        smem = ttgl.allocate_shared_memory(ttgl.int32, [512], shared, values)
+        view = smem.slice(256, 256).slice(offset, 128)
+        ttgl.store(output + ttgl.arange(0, 128, layout=layout), view.load(layout))
+
+    data = torch.arange(512, device=device, dtype=torch.int32)
+    output = torch.empty(128, device=device, dtype=torch.int32)
+    kernel[(1, )](data, output, 128)
+    torch.testing.assert_close(output, data[384:512])
+
+
 @pytest.mark.skipif(not is_cuda() or torch.cuda.get_device_capability()[0] < 9, reason="Requires ampere or newer")
 @pytest.mark.parametrize("FAILURE", [True, False])
 def test_async_copy(FAILURE, device, run_wrapper, monkeypatch, num_ctas):

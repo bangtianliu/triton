@@ -6,6 +6,7 @@
 #include "triton/Dialect/TritonNvidiaGPU/IR/Dialect.h"
 
 #include "mlir/Dialect/GPU/IR/GPUDialect.h"
+#include "mlir/Dialect/Utils/StaticValueUtils.h"
 #include "mlir/Interfaces/ControlFlowInterfaces.h"
 
 namespace ttng = mlir::triton::nvidia_gpu;
@@ -18,13 +19,14 @@ AllocationSlice::AllocationSlice(Value value,
     : allocationInterval(allocationInterval),
       accessTy(cast<triton::gpu::MemDescType>(value.getType())),
       bufferId(bufferId) {
-  // Get the memdesc_subslice information if present. If no subslice is
-  // present the whole interval is accessed
+  // Only constant offsets support the same-source logical disjointness test.
   if (auto subslice = value.getDefiningOp<triton::gpu::MemDescSubsliceOp>()) {
     // The source supplies coordinates even if a preceding subslice has not
     // folded, or the descriptor is carried through control flow or a loop.
-    subsliceOffsets = subslice.getOffsets();
-    subsliceSource = subslice.getSrc();
+    if (auto offsets = getConstantIntValues(subslice.getMixedOffsets())) {
+      subsliceOffsets = std::move(*offsets);
+      subsliceSource = subslice.getSrc();
+    }
   }
 }
 

@@ -676,3 +676,77 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     tt.return
   }
 }
+
+// -----
+
+#shared = #ttg.nvmma_shared<{swizzlingByteWidth = 128, transposed = false, elementBitWidth = 32}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  tt.func public @dynamic_subslice_swizzled_origins(%row: i32) {
+    %c16 = arith.constant 16 : i32
+    %alloc = ttg.local_alloc {allocation.offset = 256 : i32} : () -> !ttg.memdesc<32x32xf32, #shared, #smem, mutable>
+    %dynamic = ttg.memdesc_subslice %alloc[%row, 0] : !ttg.memdesc<32x32xf32, #shared, #smem, mutable> -> !ttg.memdesc<16x32xf32, #shared, #smem, mutable, 32x32>
+    // expected-remark @below {{Buffers: [256, 2048], [2304, 2048]}}
+    ttg.local_load %dynamic : !ttg.memdesc<16x32xf32, #shared, #smem, mutable, 32x32> -> tensor<16x32xf32>
+    %constant = ttg.memdesc_subslice %alloc[%c16, 0] : !ttg.memdesc<32x32xf32, #shared, #smem, mutable> -> !ttg.memdesc<16x32xf32, #shared, #smem, mutable, 32x32>
+    // expected-remark @below {{Buffers: [2304, 2048]}}
+    ttg.local_load %constant : !ttg.memdesc<16x32xf32, #shared, #smem, mutable, 32x32> -> tensor<16x32xf32>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [16, 16]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  tt.func public @dynamic_subslice_nested_padded_origins(%stage: i32, %column: i32) {
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2x16x16xf32, #shared, #smem, mutable>
+    %page = ttg.memdesc_index %alloc[%stage] : !ttg.memdesc<2x16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<16x16xf32, #shared, #smem, mutable>
+    %row = ttg.memdesc_subslice %page [8, 0] : !ttg.memdesc<16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16>
+    %dynamic = ttg.memdesc_subslice %row[0, %column] : !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16> -> !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
+    // expected-remark @below {{Buffers: [576, 528], [608, 528], [1728, 528], [1760, 528]}}
+    ttg.local_load %dynamic : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16> -> tensor<8x8xf32>
+    %nested = ttg.memdesc_subslice %dynamic [0, 4] : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16> -> !ttg.memdesc<8x4xf32, #shared, #smem, mutable, 16x16>
+    // expected-remark @below {{Buffers: [592, 512], [624, 512], [1744, 512], [1776, 512]}}
+    ttg.local_load %nested : !ttg.memdesc<8x4xf32, #shared, #smem, mutable, 16x16> -> tensor<8x4xf32>
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
+  // Pipeline-prefix offsets advance by addition and need not be multiples of
+  // the result's prefix length. The middle candidate carries into a new bit.
+  tt.func public @dynamic_subslice_prefix_origins(%stage: i32) {
+    %c1 = arith.constant 1 : i32
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<7x16xi32, #shared, #smem, mutable>
+    %source = ttg.memdesc_subslice %alloc [1, 0] : !ttg.memdesc<7x16xi32, #shared, #smem, mutable> -> !ttg.memdesc<5x16xi32, #shared, #smem, mutable, 7x16>
+    %dynamic = ttg.memdesc_subslice %source[%stage, 0] : !ttg.memdesc<5x16xi32, #shared, #smem, mutable, 7x16> -> !ttg.memdesc<3x16xi32, #shared, #smem, mutable, 7x16>
+    %page = ttg.memdesc_index %dynamic[%c1] : !ttg.memdesc<3x16xi32, #shared, #smem, mutable, 7x16> -> !ttg.memdesc<16xi32, #shared, #smem, mutable>
+    // expected-remark @below {{Buffers: [128, 64], [192, 64], [256, 64]}}
+    ttg.local_load %page : !ttg.memdesc<16xi32, #shared, #smem, mutable> -> tensor<16xi32>
+    tt.return
+  }
+
+  tt.func public @dynamic_subslice_unknown_source(%incoming: !ttg.memdesc<64xi8, #shared, #smem, mutable>, %offset: i32) {
+    %view = ttg.memdesc_subslice %incoming[%offset] : !ttg.memdesc<64xi8, #shared, #smem, mutable> -> !ttg.memdesc<32xi8, #shared, #smem, mutable, 64>
+    // expected-remark @below {{Buffers: unknown}}
+    ttg.local_load %view : !ttg.memdesc<32xi8, #shared, #smem, mutable, 64> -> tensor<32xi8>
+    tt.return
+  }
+
+  tt.func public @dynamic_subslice_many_origins(%offset: i32) {
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<1024xi8, #shared, #smem, mutable>
+    %view = ttg.memdesc_subslice %alloc[%offset] : !ttg.memdesc<1024xi8, #shared, #smem, mutable> -> !ttg.memdesc<1xi8, #shared, #smem, mutable, 1024>
+    // expected-remark-re @below {{Buffers: [0, 1], [1, 1], {{.*}}[1023, 1]}}
+    ttg.local_load %view : !ttg.memdesc<1xi8, #shared, #smem, mutable, 1024> -> tensor<1xi8>
+    tt.return
+  }
+}

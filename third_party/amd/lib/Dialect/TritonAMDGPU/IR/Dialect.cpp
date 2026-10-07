@@ -148,8 +148,29 @@ LogicalResult verifyTDMCommonLayout(Operation *op,
   if (failed(verifyTDMBlockSize(op, descTy.getShape())))
     return failure();
 
-  auto swizzledEnc =
-      llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(smemTy.getEncoding());
+  auto encoding = smemTy.getEncoding();
+  auto swizzledEnc = llvm::dyn_cast<gpu::SwizzledSharedEncodingAttr>(encoding);
+  auto shape = gpu::dropPipeliningDim(smemTy.getShape(), encoding);
+  auto allocShape = gpu::dropPipeliningDim(smemTy.getAllocShape(), encoding);
+  if (shape != allocShape) {
+    // A subview origin can be folded into the base when the tile stays
+    // contiguous and unpadded.
+    bool supported = swizzledEnc && swizzledEnc.getMaxPhase() == 1 &&
+                     gpu::lookupNumCTAs(op) == 1;
+    if (supported) {
+      auto order = swizzledEnc.getOrder();
+      while (order.size() > 1 && shape[order.back()] == 1)
+        order = order.drop_back();
+      supported = llvm::all_of(order.drop_back(), [&](unsigned dim) {
+        return shape[dim] == allocShape[dim];
+      });
+    }
+    if (!supported)
+      return op->emitOpError(
+          "TDM shared-memory subviews require a contiguous, unpadded, "
+          "unpartitioned tile in a single-CTA kernel");
+  }
+
   if (swizzledEnc && swizzledEnc.getMaxPhase() != 1)
     return op->emitOpError("TDM does not support swizzling");
 

@@ -1049,3 +1049,21 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.thr
     tt.return
   }
 }
+
+// -----
+
+#dynamic_padded_blocked = #ttg.blocked<{sizePerThread = [1, 8], threadsPerWarp = [16, 4], warpsPerCTA = [2, 1], order = [1, 0]}>
+#dynamic_padded_shared = #ttg.padded_shared<[32:+4] {order = [1, 0], shape = [32, 32]}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 64 : i32} {
+  // COMMON-LABEL: @dynamic_subslice_padded_load
+  tt.func private @dynamic_subslice_padded_load(%src: !ttg.memdesc<32x32xf16, #dynamic_padded_shared, #ttg.shared_memory>, %row: i32) -> tensor<16x32xf16, #dynamic_padded_blocked> {
+    // COMMON: llvm.add %{{.*}}, %arg1 : i32
+    %view = ttg.memdesc_subslice %src[%row, 0] : !ttg.memdesc<32x32xf16, #dynamic_padded_shared, #ttg.shared_memory> -> !ttg.memdesc<16x32xf16, #dynamic_padded_shared, #ttg.shared_memory, 32x32>
+    // COMMON: %[[AFFINE:.*]] = llvm.mul %{{.*}}, %{{.*}} : i32
+    // COMMON: %[[PAD:.*]] = llvm.lshr %[[AFFINE]], %{{.*}} : i32
+    // COMMON-NEXT: llvm.shl %[[PAD]], %{{.*}} : i32
+    // COMMON: llvm.load
+    %loaded = ttg.local_load %view : !ttg.memdesc<16x32xf16, #dynamic_padded_shared, #ttg.shared_memory, 32x32> -> tensor<16x32xf16, #dynamic_padded_blocked>
+    tt.return %loaded : tensor<16x32xf16, #dynamic_padded_blocked>
+  }
+}
