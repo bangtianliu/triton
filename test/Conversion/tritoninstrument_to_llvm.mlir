@@ -215,7 +215,8 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
     // CHECK: %[[PHYSICAL:.*]] = llvm.add %[[BYTES]], %[[TOTAL_PADDING]] : i32
     // CHECK: %[[BASE:.*]] = llvm.ptrtoint %{{.*}} : !llvm.ptr<3> to i32
     // CHECK: %[[ADDRESS:.*]] = llvm.add %[[PHYSICAL]], %[[BASE]] : i32
-    // CHECK: %[[KEY:.*]] = llvm.and %[[ADDRESS]], %{{.*}} : i32
+    // CHECK-NEXT: %[[MASK:.*]] = llvm.mlir.constant(16777215 : i32)
+    // CHECK-NEXT: %[[KEY:.*]] = llvm.and %[[ADDRESS]], %[[MASK]] : i32
     %address = tti.experimental_memdesc_to_i32 %view : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
     // CHECK: llvm.return %[[KEY]]
     tt.return %address : i32
