@@ -92,6 +92,88 @@ module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-w
     %0 = ttg.memdesc_subslice %arg0 [2, 0, 0] : !ttg.memdesc<5x8x32xf16, #shared, #smem> -> !ttg.memdesc<3x8x32xf16, #shared, #smem, 5x8x32>
     tt.return
   }
+
+  // Invalid offset values produce poison descriptors, even when statically
+  // known. They remain well-formed in unreachable code and are never consumed.
+  // CHECK-LABEL: @multibuffer_subview_poison_offsets
+  tt.func @multibuffer_subview_poison_offsets(%src: !ttg.memdesc<8x8x32xf16, #shared, #smem>) {
+    // CHECK: %[[FALSE:.*]] = arith.constant false
+    %false = arith.constant false
+    // CHECK: scf.if %[[FALSE]]
+    scf.if %false {
+      // An out-of-bounds offset in the pipeline dimension.
+      // CHECK: ttg.memdesc_subslice %{{.*}}[6, 0, 0]
+      %out_of_bounds = ttg.memdesc_subslice %src [6, 0, 0] : !ttg.memdesc<8x8x32xf16, #shared, #smem> -> !ttg.memdesc<3x8x32xf16, #shared, #smem, 8x8x32>
+      // A nonzero offset in an unchanged pipeline dimension.
+      // CHECK: ttg.memdesc_subslice %{{.*}}[3, 0, 0]
+      %unchanged_dimension = ttg.memdesc_subslice %src [3, 0, 0] : !ttg.memdesc<8x8x32xf16, #shared, #smem> -> !ttg.memdesc<8x8x32xf16, #shared, #smem>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#swizzled = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 16, order = [0, 1]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @memdesc_subslice_poison_offsets
+  tt.func @memdesc_subslice_poison_offsets(%src: !ttg.memdesc<8x16xf32, #shared, #smem>, %stages: !ttg.memdesc<5x8x16xf32, #shared, #smem>, %offset: i32) {
+    // CHECK: %[[FALSE:.*]] = arith.constant false
+    %false = arith.constant false
+    // CHECK: scf.if %[[FALSE]]
+    scf.if %false {
+      // Negative offsets, static out-of-bounds or unaligned offsets mixed
+      // with dynamic offsets, and nonzero offsets in unchanged dimensions.
+      // CHECK: ttg.memdesc_subslice %{{.*}}[-4, 0]
+      %negative = ttg.memdesc_subslice %src [-4, 0] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>
+      // CHECK: ttg.memdesc_subslice %{{.*}}[8, %{{.*}}]
+      %out_of_bounds = ttg.memdesc_subslice %src [8, %offset] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x8xf32, #shared, #smem, 8x16>
+      // CHECK: ttg.memdesc_subslice %{{.*}}[2, %{{.*}}]
+      %unaligned = ttg.memdesc_subslice %src [2, %offset] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x8xf32, #shared, #smem, 8x16>
+      // CHECK: ttg.memdesc_subslice %{{.*}}[%{{.*}}, 1]
+      %unchanged_dimension = ttg.memdesc_subslice %src [%offset, 1] : !ttg.memdesc<8x16xf32, #shared, #smem> -> !ttg.memdesc<4x16xf32, #shared, #smem, 8x16>
+      // The pipeline dimension allows arbitrary offsets, but offset 2 is
+      // unaligned to the size-4 tile in the next dimension.
+      // CHECK: ttg.memdesc_subslice %{{.*}}[2, 2, 0]
+      %unaligned_non_pipeline = ttg.memdesc_subslice %stages [2, 2, 0] : !ttg.memdesc<5x8x16xf32, #shared, #smem> -> !ttg.memdesc<3x4x16xf32, #shared, #smem, 5x8x16>
+    }
+    tt.return
+  }
+
+  // CHECK-LABEL: @subview_along_swizzling
+  tt.func @subview_along_swizzling(%src: !ttg.memdesc<8x16xf32, #swizzled, #smem>) {
+    // CHECK: %[[FALSE:.*]] = arith.constant false
+    %false = arith.constant false
+    // CHECK: scf.if %[[FALSE]]
+    scf.if %false {
+      // The result shape preserves the swizzling pattern; the offset is
+      // unaligned and produces poison if this branch executes.
+      // CHECK: ttg.memdesc_subslice %{{.*}}[2, 0]
+      %unaligned = ttg.memdesc_subslice %src [2, 0] : !ttg.memdesc<8x16xf32, #swizzled, #smem> -> !ttg.memdesc<4x16xf32, #swizzled, #smem, 8x16>
+    }
+    tt.return
+  }
+}
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.target" = "cuda:0", "ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // CHECK-LABEL: @dynamic_subslice_multi_cta
+  tt.func @dynamic_subslice_multi_cta(%src: !ttg.memdesc<4x32xi32, #shared, #smem>, %row: i32) {
+    // CHECK: %[[FALSE:.*]] = arith.constant false
+    %false = arith.constant false
+    // CHECK: scf.if %[[FALSE]]
+    scf.if %false {
+      // Dynamic subslicing requires one CTA when executed.
+      // CHECK: ttg.memdesc_subslice %{{.*}}[%{{.*}}, 0]
+      %view = ttg.memdesc_subslice %src [%row, 0] : !ttg.memdesc<4x32xi32, #shared, #smem> -> !ttg.memdesc<2x32xi32, #shared, #smem, 4x32>
+    }
+    tt.return
+  }
 }
 
 // -----

@@ -528,10 +528,10 @@ class shared_memory_descriptor(base_value):
         The subview preserves rank and layout. The start may be a runtime scalar
         of type ``int32``; length and dimension must be compile-time constants.
         The slice must stay within this descriptor's shape. In a layout dimension,
-        the start must be a multiple of the slice length. These are preconditions
-        for runtime starts and are not checked at runtime. The existing layout
-        restrictions on slicing also apply to runtime starts. Runtime starts
-        require ``num_ctas=1``.
+        the start must be a multiple of the slice length. The start must be zero
+        when the dimension's size is unchanged. Runtime starts require ``num_ctas=1``.
+        Violating these preconditions produces a poison descriptor. The existing
+        layout restrictions on slicing also apply to runtime starts.
 
         Args:
             start (int or tensor): The starting index of the slice.

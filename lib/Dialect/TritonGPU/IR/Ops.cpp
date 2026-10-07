@@ -1231,7 +1231,10 @@ OpFoldResult MemDescSubsliceOp::fold(FoldAdaptor adaptor) {
     // Compute combined offsets
     SmallVector<int64_t> combinedOffsets;
     for (size_t i = 0; i < currOffsets.size(); ++i) {
-      combinedOffsets.push_back(srcOffsets[i] + currOffsets[i]);
+      int64_t offset = srcOffsets[i] + currOffsets[i];
+      if (!llvm::isInt<32>(offset))
+        return {};
+      combinedOffsets.push_back(offset);
     }
 
     // Update this operation to point directly to the original source with
@@ -1253,19 +1256,10 @@ LogicalResult MemDescSubsliceOp::verify() {
                                             getOffsets(), getDynamicOffsets())))
     return failure();
   if (!getDynamicOffsets().empty()) {
-    if (lookupNumCTAs(*this) != 1)
-      return emitError("dynamic subslicing requires a single-CTA kernel");
     if (srcTy.getMemorySpace() != dstTy.getMemorySpace())
       return emitError("source and result must have the same memory space");
     if (srcTy.getMutableMemory() != dstTy.getMutableMemory())
       return emitError("source and result must have the same mutability");
-  }
-  SmallVector<std::optional<int64_t>> offsets;
-  for (OpFoldResult offset : getMixedOffsets()) {
-    auto value = getConstantIntValue(offset);
-    if (value && !llvm::isInt<32>(*value))
-      return emitError("offsets must fit in i32");
-    offsets.push_back(value);
   }
   if (srcTy.getElementType() != dstTy.getElementType()) {
     return emitError("result element type must match desc element type");
@@ -1292,31 +1286,17 @@ LogicalResult MemDescSubsliceOp::verify() {
 
   SetVector<int> splitDims{};
   for (int i = 0; i < srcTy.getRank(); i++) {
-    if (!offsets[i] && dstTy.getDimSize(i) > srcTy.getDimSize(i))
+    if (dstTy.getDimSize(i) > srcTy.getDimSize(i))
       return emitError("result dimensions must not exceed the source shape");
     if (srcTy.getDimSize(i) != dstTy.getDimSize(i)) {
       splitDims.insert(i);
     }
   }
-  for (auto [dim, knownOffset] : llvm::enumerate(offsets)) {
-    if (!knownOffset)
-      continue;
-    int64_t offset = *knownOffset;
-    if (!splitDims.contains(dim)) {
-      if (offset != 0) {
-        return emitError("A non zero offset found in a dimension that is "
-                         "not being split");
-      }
-    } else {
-      if (offset < 0 ||
-          offset > srcTy.getDimSize(dim) - dstTy.getDimSize(dim)) {
-        return emitError("The split offset may not exceed the source shape");
-      }
-      if (dim >= prefixRank && (offset & (dstTy.getDimSize(dim) - 1))) {
-        return emitError("The split offset may not touch the tile");
-      }
-    }
-  }
+  // Offset bounds/alignment are execution preconditions, so folding SSA
+  // producers or retaining unreachable views cannot invalidate the IR.
+  for (int64_t offset : getOffsets())
+    if (!ShapedType::isDynamic(offset) && !llvm::isInt<32>(offset))
+      return emitError("offsets must fit in i32");
   // Identity subview
   if (splitDims.empty())
     return success();

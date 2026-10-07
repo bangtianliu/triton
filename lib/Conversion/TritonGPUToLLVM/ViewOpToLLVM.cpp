@@ -451,6 +451,11 @@ struct MemDescSubsliceOpConversion
   matchAndRewrite(triton::gpu::MemDescSubsliceOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
     Location loc = op->getLoc();
+    if (!op.getDynamicOffsets().empty() && lookupNumCTAs(op) != 1) {
+      rewriter.replaceOpWithNewOp<LLVM::PoisonOp>(
+          op, getTypeConverter()->convertType(op.getType()));
+      return success();
+    }
     auto b = TritonLLVMOpBuilder(loc, rewriter);
     auto *ctx = op.getContext();
     auto srcTy = op.getSrc().getType();

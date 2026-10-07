@@ -3760,3 +3760,18 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
     tt.return %view : !ttg.memdesc<8x16xf16, #shared, #smem, 16x16>
   }
 }
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0], CGALayout = [[1, 0]]}>
+#smem = #ttg.shared_memory
+module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
+  // CHECK-LABEL: @dynamic_subslice_multi_cta_poison
+  tt.func private @dynamic_subslice_multi_cta_poison(%src: !ttg.memdesc<4x32xi32, #shared, #smem>, %row: i32) -> !ttg.memdesc<2x32xi32, #shared, #smem, 4x32> {
+    // Returning poison is allowed; this function does not access the descriptor.
+    // CHECK: %[[POISON:.*]] = llvm.mlir.poison : !llvm.struct<(ptr<3>, i32, i32)>
+    %view = ttg.memdesc_subslice %src[%row, 0] : !ttg.memdesc<4x32xi32, #shared, #smem> -> !ttg.memdesc<2x32xi32, #shared, #smem, 4x32>
+    // CHECK-NEXT: llvm.return %[[POISON]]
+    tt.return %view : !ttg.memdesc<2x32xi32, #shared, #smem, 4x32>
+  }
+}

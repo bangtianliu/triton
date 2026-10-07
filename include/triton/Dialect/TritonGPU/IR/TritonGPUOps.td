@@ -266,8 +266,7 @@ def TTG_MemDescSubsliceOp : TTG_Op<"memdesc_subslice", [Pure, MemDescViewTrait]>
   let description = [{
     Returns a same-rank subview, preserving the source encoding and allocation
     shape. Offsets may be static integers or runtime i32 values. Runtime offsets
-    are uniform within the logical block or warp-specialized execution region
-    and require a single-CTA kernel.
+    are uniform within the logical block or warp-specialized execution region.
 
     For example, an 8x16 subview of a 32x16 descriptor with offsets [16, 0]
     covers input[16:24, 0:16].
@@ -275,12 +274,14 @@ def TTG_MemDescSubsliceOp : TTG_Op<"memdesc_subslice", [Pure, MemDescViewTrait]>
     The caller must ensure that offsets keep the view within the source shape
     and are multiples of the result dimension size, except along a leading
     pipeline dimension, which needs no tile alignment. Offsets in unchanged
-    dimensions must be zero. Statically known offsets are verified; violating
-    these requirements at runtime is undefined behavior. The layout and tile
-    restrictions are the same for static and runtime offsets.
+    dimensions must be zero. Runtime offsets require a single-CTA kernel.
+    Violating these preconditions produces a poison descriptor. The layout and
+    tile restrictions are the same for static and runtime offsets.
 
     This operation does not access the underlying memory.
   }];
+  // MLIR's mixed-offset helpers need i64 to store ShapedType::kDynamic
+  // (INT64_MIN); actual static and dynamic offsets must fit in i32.
   let arguments = (ins TTG_MemDescType:$src, Variadic<I32>:$dynamicOffsets,
                        DenseI64ArrayAttr:$offsets);
   // Use qualified() otherwise "!ttg.memdesc<X>" is printed as "<X>".

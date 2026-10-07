@@ -57,7 +57,9 @@ Value triton::getMemDescAddress(RewriterBase &rewriter, Location loc,
   // Partitioned slices rotate their bases so the first is the logical origin.
   auto base = b.ptrtoint(i32Ty, object.getBases().front());
   // Strip the cluster CTA index from shared addresses.
-  return b.and_(b.add(offset, base), b.i32_val((1u << 24) - 1));
+  auto address = b.add(offset, base);
+  auto mask = b.i32_val((1u << 24) - 1);
+  return b.and_(address, mask);
 }
 
 namespace triton::gpu {
@@ -654,10 +656,9 @@ materializeLocalAddrs(Location loc, triton::gpu::MemDescType memDescTy,
     //   target_cta = block(L⁻¹(coords)) ⊕
     //                block(L⁻¹(subslice_logical_offset))
     //
-    // We use XOR for consistency with lowerLdSt. MemDescSubsliceOp::verify()
-    // enforces:
-    // 1. Subslice offsets must be multiples of the tile size
-    // 2. Subslice offsets must map to power-of-2 physical offsets
+    // We use XOR for consistency with lowerLdSt. Subslice offsets must be
+    // multiples of the tile size by the operation's contract. The verifier
+    // ensures splitting preserves individual physical offset bits.
     //
     // These constraints ensure the bit ranges of L⁻¹(coords) and
     // L⁻¹(subslice_offset) are disjoint, so XOR and addition are equivalent.
