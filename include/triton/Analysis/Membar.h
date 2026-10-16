@@ -93,7 +93,7 @@ public:
 
 private:
   std::tuple<Interval<size_t>, Allocation::BufferId, const void *,
-             llvm::ArrayRef<int32_t>, const BufferIndexExpr *, const void *,
+             llvm::ArrayRef<int64_t>, const BufferIndexExpr *, const void *,
              const void *, std::optional<unsigned>>
   asTuple() const {
     return {allocationInterval,
@@ -105,9 +105,9 @@ private:
             physicalFootprint,
             argumentIndex};
   }
-  // Offsets from subslice, borrowed from its immutable context-owned attribute.
-  // Empty when offsets are unknown.
-  llvm::ArrayRef<int32_t> subsliceOffsets;
+  // Constant subslice offsets, including constants supplied as SSA values.
+  // Empty when any offset is unknown.
+  llvm::SmallVector<int64_t> subsliceOffsets;
   // The source descriptor supplying the coordinates for subslice offsets.
   Value subsliceSource;
   // The allocated interval for this buffer

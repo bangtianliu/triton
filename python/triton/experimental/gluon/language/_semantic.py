@@ -463,7 +463,9 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         return self.tensor(handle, res_ty)
 
     def memdesc_slice(self, mem_desc, start, length, dim):
-        _check(isinstance(start, int), lambda: f"expected 'start' to be an int but got {start}")
+        if not isinstance(start, int):
+            start = self.to_tensor(start)
+            _check(start.type == ttgl.int32, lambda: f"expected 'start' to be int32 but got {start.type}")
         _check(isinstance(length, int), lambda: f"expected 'length' to be an int but got {length}")
         _check(isinstance(dim, int), lambda: f"expected 'dim' to be an int but got {dim}")
         offsets = [0] * mem_desc.rank
@@ -473,6 +475,7 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         layout = mem_desc.layout
         ty = ttgl.shared_memory_descriptor_type(mem_desc.dtype, shape, layout, mem_desc.type.alloc_shape)
         builder = self.builder
+        offsets = [offset if isinstance(offset, int) else offset.handle for offset in offsets]
         handle = builder.create_memdesc_subslice(ty.to_ir(builder), mem_desc.handle, offsets)
         return ttgl.shared_memory_descriptor(handle, **ty.__dict__)
 
