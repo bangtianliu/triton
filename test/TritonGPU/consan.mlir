@@ -3919,3 +3919,36 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.thr
     tt.return %result : tensor<1xi32>
   }
 }
+
+// -----
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32, ttg.shared = 32768 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32} {
+  // CHECK-LABEL: @dynamic_subslice_large_origin_select_state
+  tt.func public @dynamic_subslice_large_origin_select_state(%raw: i32, %choose: i1, %input: tensor<32768xi8>) -> tensor<1xi8> {
+    %c32767 = arith.constant 32767 : i32
+    %offset = arith.andi %raw, %c32767 : i32
+    // The allocation and unknown region require two state lanes.
+    // CHECK: %[[ALLOC:.*]] = ttg.local_alloc
+    %alloc = ttg.local_alloc %input {allocation.offset = 0 : i32} : (tensor<32768xi8>) -> !ttg.memdesc<32768xi8, #shared, #smem, mutable>
+    // CHECK: arith.constant dense<[true, false]> : tensor<2xi1
+    %view = ttg.memdesc_subslice %alloc[%offset] : !ttg.memdesc<32768xi8, #shared, #smem, mutable> -> !ttg.memdesc<1xi8, #shared, #smem, mutable, 32768>
+    %known = ttg.memdesc_subslice %alloc[0] : !ttg.memdesc<32768xi8, #shared, #smem, mutable> -> !ttg.memdesc<1xi8, #shared, #smem, mutable, 32768>
+    // CHECK: %[[SELECTED:.*]] = arith.select {{.*}} : !ttg.memdesc<1xi8
+    %selected = arith.select %choose, %view, %known : !ttg.memdesc<1xi8, #shared, #smem, mutable, 32768>
+    // CHECK-NOT: tti.experimental_memdesc_to_i32
+    // CHECK-NOT: tti.experimental_memory_offset_to_i32
+    // CHECK: arith.constant dense<true> : tensor<2xi1
+    // CHECK-NOT: tti.experimental_memdesc_to_i32
+    // CHECK-NOT: tti.experimental_memory_offset_to_i32
+    // CHECK: tt.call @__triton_consan_verify_write_visibility
+    // CHECK: tt.call @__triton_consan_set_read_visibility_nw1_T2xI1_
+    // CHECK-NOT: tti.experimental_memdesc_to_i32
+    // CHECK-NOT: tti.experimental_memory_offset_to_i32
+    // CHECK: ttg.local_load %[[SELECTED]]
+    %result = ttg.local_load %selected : !ttg.memdesc<1xi8, #shared, #smem, mutable, 32768> -> tensor<1xi8>
+    tt.return %result : tensor<1xi8>
+  }
+}

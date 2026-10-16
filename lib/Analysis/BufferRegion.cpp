@@ -715,12 +715,12 @@ LogicalResult BufferRegionAnalysis::visitOperation(
   }
   if (auto memdescIndexOp = dyn_cast<ttg::MemDescIndexOp>(op)) {
     const RegionInfo &in = operands[0]->getValue();
-    if (in.isUnknown())
+    if (in.isUnknown() || in.views.empty())
       return propagateRegions(in);
-    int numSubBuffers =
+    int64_t numSubBuffers =
         cast<ttg::MemDescType>(memdescIndexOp.getSrc().getType()).getShape()[0];
-    int firstSubBuffer = 0;
-    int endSubBuffer = numSubBuffers;
+    int64_t firstSubBuffer = 0;
+    int64_t endSubBuffer = numSubBuffers;
     APInt constantIndex;
     if (matchPattern(memdescIndexOp.getIndex(),
                      m_ConstantInt(&constantIndex))) {
@@ -728,8 +728,11 @@ LogicalResult BufferRegionAnalysis::visitOperation(
       firstSubBuffer = index;
       endSubBuffer = index + 1;
     }
+    if (static_cast<uint64_t>(endSubBuffer - firstSubBuffer) >
+        RegionInfo::kMaxViews / in.views.size())
+      return propagateRegions(RegionInfo::getPessimisticValueState());
     for (const BufferRegionView &view : in.views) {
-      for (int i = firstSubBuffer; i < endSubBuffer; ++i) {
+      for (int64_t i = firstSubBuffer; i < endSubBuffer; ++i) {
         uint32_t stageOffset =
             getMemDescStorageOffset(memdescIndexOp.getType(), i);
         regionInfo.views.insert(
@@ -762,6 +765,7 @@ LogicalResult BufferRegionAnalysis::visitOperation(
     }
 
     size_t numOffsets = 1;
+    size_t maxOffsets = RegionInfo::kMaxViews / in.views.size();
     auto srcTy = memdescSubsliceOp.getSrc().getType();
     unsigned prefixRank =
         srcTy.getRank() -
@@ -778,6 +782,9 @@ LogicalResult BufferRegionAnalysis::visitOperation(
         // Unchanged dimensions have only the zero offset.
         count = (srcTy.getDimSize(dim) - dstTy.getDimSize(dim)) / step + 1;
       }
+      // Check the full expansion before allocating candidate offsets.
+      if (static_cast<uint64_t>(count) > maxOffsets / numOffsets)
+        return propagateRegions(RegionInfo::getPessimisticValueState());
       numOffsets *= count;
       SmallVector<int64_t> offsets;
       for (int64_t i = 0; i < count; ++i)

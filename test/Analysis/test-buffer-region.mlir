@@ -749,4 +749,48 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32} {
     ttg.local_load %view : !ttg.memdesc<1xi8, #shared, #smem, mutable, 1024> -> tensor<1xi8>
     tt.return
   }
+
+  tt.func public @dynamic_subslice_excess_origins(%offset: i32) {
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<32768xi8, #shared, #smem, mutable>
+    %view = ttg.memdesc_subslice %alloc[%offset] : !ttg.memdesc<32768xi8, #shared, #smem, mutable> -> !ttg.memdesc<1xi8, #shared, #smem, mutable, 32768>
+    // expected-remark @below {{Buffers: unknown}}
+    ttg.local_load %view : !ttg.memdesc<1xi8, #shared, #smem, mutable, 32768> -> tensor<1xi8>
+    tt.return
+  }
+
+  tt.func public @dynamic_subslice_combined_origins(%stage: i32, %offset: i32) {
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<32x64xi8, #shared, #smem, mutable>
+    %page = ttg.memdesc_index %alloc[%stage] : !ttg.memdesc<32x64xi8, #shared, #smem, mutable> -> !ttg.memdesc<64xi8, #shared, #smem, mutable>
+    %view = ttg.memdesc_subslice %page[%offset] : !ttg.memdesc<64xi8, #shared, #smem, mutable> -> !ttg.memdesc<1xi8, #shared, #smem, mutable, 64>
+    // expected-remark @below {{Buffers: unknown}}
+    ttg.local_load %view : !ttg.memdesc<1xi8, #shared, #smem, mutable, 64> -> tensor<1xi8>
+    tt.return
+  }
+
+  tt.func public @dynamic_index_excess_origins(%stage: i32) {
+    %c2047 = arith.constant 2047 : i32
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2048x1xi8, #shared, #smem, mutable>
+    %dynamic = ttg.memdesc_index %alloc[%stage] : !ttg.memdesc<2048x1xi8, #shared, #smem, mutable> -> !ttg.memdesc<1xi8, #shared, #smem, mutable>
+    // expected-remark @below {{Buffers: unknown}}
+    ttg.local_load %dynamic : !ttg.memdesc<1xi8, #shared, #smem, mutable> -> tensor<1xi8>
+    %constant = ttg.memdesc_index %alloc[%c2047] : !ttg.memdesc<2048x1xi8, #shared, #smem, mutable> -> !ttg.memdesc<1xi8, #shared, #smem, mutable>
+    // expected-remark @below {{Buffers: [2047, 1]}}
+    ttg.local_load %constant : !ttg.memdesc<1xi8, #shared, #smem, mutable> -> tensor<1xi8>
+    tt.return
+  }
+
+  tt.func public @select_subslice_origins_at_limit(%offset: i32, %cond: i1) {
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2048xi8, #shared, #smem, mutable>
+    %half = ttg.memdesc_subslice %alloc [0] : !ttg.memdesc<2048xi8, #shared, #smem, mutable> -> !ttg.memdesc<1024xi8, #shared, #smem, mutable, 2048>
+    %dynamic = ttg.memdesc_subslice %half[%offset] : !ttg.memdesc<1024xi8, #shared, #smem, mutable, 2048> -> !ttg.memdesc<1xi8, #shared, #smem, mutable, 2048>
+    %outside = ttg.memdesc_subslice %alloc [1024] : !ttg.memdesc<2048xi8, #shared, #smem, mutable> -> !ttg.memdesc<1xi8, #shared, #smem, mutable, 2048>
+    %overflow = arith.select %cond, %dynamic, %outside : !ttg.memdesc<1xi8, #shared, #smem, mutable, 2048>
+    // expected-remark @below {{Buffers: unknown}}
+    ttg.local_load %overflow : !ttg.memdesc<1xi8, #shared, #smem, mutable, 2048> -> tensor<1xi8>
+    %inside = ttg.memdesc_subslice %alloc [1023] : !ttg.memdesc<2048xi8, #shared, #smem, mutable> -> !ttg.memdesc<1xi8, #shared, #smem, mutable, 2048>
+    %overlap = arith.select %cond, %dynamic, %inside : !ttg.memdesc<1xi8, #shared, #smem, mutable, 2048>
+    // expected-remark-re @below {{Buffers: [0, 1], [1, 1], {{.*}}[1023, 1]}}
+    ttg.local_load %overlap : !ttg.memdesc<1xi8, #shared, #smem, mutable, 2048> -> tensor<1xi8>
+    tt.return
+  }
 }
