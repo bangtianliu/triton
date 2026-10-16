@@ -180,6 +180,9 @@ struct RegionInfo {
   enum class Kind { Uninitialized, Exact, Unknown };
   using ViewList = std::set<BufferRegionView>;
 
+  // ConSan builds a state mask for each exact view.
+  static constexpr unsigned kMaxViews = 1024;
+
   Kind kind = Kind::Uninitialized;
   ViewList views;
 
@@ -189,14 +192,19 @@ struct RegionInfo {
   bool isUnknown() const { return kind == Kind::Unknown; }
 
   static RegionInfo join(const RegionInfo &lhs, const RegionInfo &rhs) {
-    if (lhs.isUnknown() || rhs.isUnknown())
+    if (lhs.isUnknown() || rhs.isUnknown() || lhs.views.size() > kMaxViews ||
+        rhs.views.size() > kMaxViews)
       return getPessimisticValueState();
     if (lhs.kind == Kind::Uninitialized)
       return rhs;
     if (rhs.kind == Kind::Uninitialized)
       return lhs;
     RegionInfo result = lhs;
-    result.views.insert(rhs.views.begin(), rhs.views.end());
+    for (const BufferRegionView &view : rhs.views) {
+      result.views.insert(view);
+      if (result.views.size() > kMaxViews)
+        return getPessimisticValueState();
+    }
     return result;
   }
 

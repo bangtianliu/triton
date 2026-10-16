@@ -9,6 +9,7 @@
 // RUN: not triton-opt %t/private-cross-cta-scratch.mlir -allow-unregistered-dialect -tritoninstrument-concurrency-sanitizer 2>&1 | FileCheck %t/private-cross-cta-scratch.mlir --check-prefix=CROSS-CTA
 // RUN: not triton-opt %t/missing-target.mlir -tritoninstrument-concurrency-sanitizer 2>&1 | FileCheck %t/missing-target.mlir --check-prefix=MISSING-TARGET
 // RUN: not triton-opt %t/unsupported-target.mlir -tritoninstrument-concurrency-sanitizer 2>&1 | FileCheck %t/unsupported-target.mlir --check-prefix=UNSUPPORTED-TARGET
+// RUN: not triton-opt %t/unknown-barrier-region.mlir -allow-unregistered-dialect -tritoninstrument-concurrency-sanitizer 2>&1 | FileCheck %t/unknown-barrier-region.mlir --check-prefix=UNKNOWN-BARRIER
 
 //--- missing-target.mlir
 
@@ -19,6 +20,25 @@ module {}
 
 // UNSUPPORTED-TARGET: unsupported ConSan target 'cpu'
 module attributes {ttg.target = "cpu"} {}
+
+//--- unknown-barrier-region.mlir
+
+#shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
+#smem = #ttg.shared_memory
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 1 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 1 : i32, ttg.shared = 16384 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32} {
+  // UNKNOWN-BARRIER: ConSan requires exact buffer regions for barrier tracking
+  tt.func public @unknown_barrier_region(%raw: i32) {
+    %c0 = arith.constant 0 : i32
+    %c2047 = arith.constant 2047 : i32
+    %offset = arith.andi %raw, %c2047 : i32
+    %alloc = ttg.local_alloc {allocation.offset = 0 : i32} : () -> !ttg.memdesc<2048x1xi64, #shared, #smem, mutable>
+    %slot = ttg.memdesc_subslice %alloc[%offset, 0] : !ttg.memdesc<2048x1xi64, #shared, #smem, mutable> -> !ttg.memdesc<1x1xi64, #shared, #smem, mutable, 2048x1>
+    %barrier = ttg.memdesc_index %slot[%c0] : !ttg.memdesc<1x1xi64, #shared, #smem, mutable, 2048x1> -> !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    ttng.init_barrier %barrier, 1 : !ttg.memdesc<1xi64, #shared, #smem, mutable>
+    tt.return
+  }
+}
 
 //--- missing.mlir
 
