@@ -471,6 +471,7 @@ class GluonSemantic(TritonSemantic[TensorTy]):
         if not isinstance(start, int):
             start = self.to_tensor(start)
             _check(start.type == ttgl.int32, lambda: f"expected 'start' to be int32 but got {start.type}")
+            _check(self.builder.options.num_ctas == 1, lambda: "runtime slice starts require num_ctas=1")
         _check(isinstance(length, int), lambda: f"expected 'length' to be an int but got {length}")
         _check(isinstance(dim, int), lambda: f"expected 'dim' to be an int but got {dim}")
         offsets = [0] * mem_desc.rank

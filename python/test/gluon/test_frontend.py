@@ -575,6 +575,46 @@ def test_shared_memory_dynamic_slice_invalid_argument(kind):
         run_parser(kernel, *make_args(2, kind))
 
 
+@pytest.mark.parametrize("start, length, message", [
+    (-4, 4, "may not exceed the source shape"),
+    (60, 8, "may not exceed the source shape"),
+    (4, 8, "may not touch the tile"),
+    (1, 64, "not being split"),
+])
+def test_shared_memory_static_slice_invalid_offset(start, length, message):
+
+    @gluon.jit
+    def kernel(START: ttgl.constexpr, LENGTH: ttgl.constexpr):
+        smem = ttgl.allocate_shared_memory(ttgl.int32, [64, 64], ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
+        smem.slice(START, LENGTH)
+
+    with pytest.raises(CompilationError) as e:
+        run_parser(kernel, *make_args(start, length))
+    assert message in str(e.value.__cause__)
+
+
+def test_shared_memory_static_slice_pipeline_offset():
+
+    @gluon.jit
+    def kernel():
+        smem = ttgl.allocate_shared_memory(ttgl.int32, [3, 8, 64], ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
+        # Pipeline dimensions need no tile alignment.
+        smem.slice(1, 2)
+
+    run_parser(kernel)
+
+
+def test_shared_memory_dynamic_slice_multi_cta():
+
+    @gluon.jit(do_not_specialize=["start"])
+    def kernel(start):
+        smem = ttgl.allocate_shared_memory(ttgl.int32, [8, 64], ttgl.SwizzledSharedLayout(1, 1, 1, [1, 0]))
+        smem.slice(start, 1)
+
+    with pytest.raises(CompilationError, match="runtime slice starts require num_ctas=1"):
+        run_parser(kernel, *make_args(2, num_ctas=2))
+
+
 @gluon.jit
 def shared_memory_index_kernel(XBLOCK: ttgl.constexpr, layout: ttgl.constexpr, smem_layout: ttgl.constexpr):
     smem = ttgl.allocate_shared_memory(ttgl.int32, [4, XBLOCK], smem_layout)

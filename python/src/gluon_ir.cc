@@ -910,13 +910,35 @@ void init_gluon_ir(py::module_ &m) {
       .def("create_memdesc_subslice",
            [](GluonOpBuilder &self, Type resultType, Value src,
               py::list offsets) -> Value {
+             auto srcTy = cast<ttg::MemDescType>(src.getType());
+             auto dstTy = cast<ttg::MemDescType>(resultType);
+             unsigned prefixRank =
+                 srcTy.getRank() -
+                 ttg::dropPipeliningDim(srcTy.getShape(), srcTy.getEncoding())
+                     .size();
              SmallVector<OpFoldResult> mixedOffsets;
-             for (py::handle offset : offsets) {
-               if (py::isinstance<py::int_>(offset))
-                 mixedOffsets.push_back(self.getBuilder().getI64IntegerAttr(
-                     py::cast<int64_t>(offset)));
-               else
+             for (size_t dim = 0; dim < offsets.size(); ++dim) {
+               py::handle offset = offsets[dim];
+               if (!py::isinstance<py::int_>(offset)) {
                  mixedOffsets.push_back(py::cast<Value>(offset));
+                 continue;
+               }
+               // The op treats invalid offsets as poison, so diagnose
+               // statically known offsets here.
+               auto value = py::cast<int64_t>(offset);
+               int64_t srcSize = srcTy.getDimSize(dim);
+               int64_t dstSize = dstTy.getDimSize(dim);
+               if (srcSize == dstSize && value != 0)
+                 throw py::value_error("A non zero offset found in a "
+                                       "dimension that is not being split");
+               if (value < 0 || value > srcSize - dstSize)
+                 throw py::value_error(
+                     "The split offset may not exceed the source shape");
+               if (dim >= prefixRank && value % dstSize != 0)
+                 throw py::value_error(
+                     "The split offset may not touch the tile");
+               mixedOffsets.push_back(
+                   self.getBuilder().getI64IntegerAttr(value));
              }
              return self.create<ttg::MemDescSubsliceOp>(resultType, src,
                                                         mixedOffsets);
