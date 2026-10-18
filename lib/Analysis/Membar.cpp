@@ -24,6 +24,8 @@ AllocationSlice::AllocationSlice(Value value,
       accessTy(cast<triton::gpu::MemDescType>(value.getType())),
       bufferId(bufferId) {
   // Only constant offsets support the same-source logical disjointness test.
+  // Runtime offsets leave subsliceSource unset, so intersects() relies on the
+  // physical footprint, which covers every possible runtime origin.
   if (auto subslice = value.getDefiningOp<triton::gpu::MemDescSubsliceOp>()) {
     // The source supplies coordinates even if a preceding subslice has not
     // folded, or the descriptor is carried through control flow or a loop.

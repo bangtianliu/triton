@@ -759,6 +759,7 @@ LogicalResult BufferRegionAnalysis::visitOperation(
             relativeOffset.ctaOffset));
     };
     auto mixedOffsets = memdescSubsliceOp.getMixedOffsets();
+    // Static offsets: add the single exact subview of each source view.
     if (auto offsets = getConstantIntValues(mixedOffsets)) {
       addViews(*offsets);
       return propagateRegions(regionInfo);
@@ -792,6 +793,7 @@ LogicalResult BufferRegionAnalysis::visitOperation(
       offsetsByDim.push_back(std::move(offsets));
     }
 
+    // Runtime offsets: add the subview for every valid candidate offset tuple.
     SmallVector<int64_t> offsets(srcTy.getRank());
     for (size_t candidate = 0; candidate < numOffsets; ++candidate) {
       size_t remaining = candidate;
