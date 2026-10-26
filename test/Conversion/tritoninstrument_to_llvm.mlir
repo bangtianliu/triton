@@ -206,16 +206,16 @@ module attributes {"ttg.num-warps" = 4 : i32, ttg.target = "cuda:90"} {
     %upper = ttg.memdesc_subslice %alloc[8, 0] : !ttg.memdesc<16x16xf32, #shared, #smem, mutable> -> !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16>
     %view = ttg.memdesc_subslice %upper[0, %column] : !ttg.memdesc<8x16xf32, #shared, #smem, mutable, 16x16> -> !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
     // Columns 0 and 8 have physical byte offsets 576 and 608, including padding.
-    // CHECK: %[[BYTES:.*]] = llvm.mul %{{.*}}, %{{.*}} : i32
     // CHECK-DAG: %[[INTERVAL_SHIFT:.*]] = llvm.mlir.constant(7 : i32)
     // CHECK-DAG: %[[PADDING_SHIFT:.*]] = llvm.mlir.constant(4 : i32)
+    // CHECK-DAG: %[[MASK:.*]] = llvm.mlir.constant(16777215 : i32)
+    // CHECK: %[[BYTES:.*]] = llvm.mul %{{.*}}, %{{.*}} : i32
     // CHECK: %[[INTERVALS:.*]] = llvm.lshr %[[BYTES]], %[[INTERVAL_SHIFT]] : i32
     // CHECK: %[[PADDING:.*]] = llvm.shl %[[INTERVALS]], %[[PADDING_SHIFT]] : i32
-    // CHECK: %[[TOTAL_PADDING:.*]] = llvm.add %{{.*}}, %[[PADDING]] : i32
+    // CHECK: %[[TOTAL_PADDING:.*]] = llvm.add %[[PADDING]], %{{.*}} : i32
     // CHECK: %[[PHYSICAL:.*]] = llvm.add %[[BYTES]], %[[TOTAL_PADDING]] : i32
     // CHECK: %[[BASE:.*]] = llvm.ptrtoint %{{.*}} : !llvm.ptr<3> to i32
     // CHECK: %[[ADDRESS:.*]] = llvm.add %[[PHYSICAL]], %[[BASE]] : i32
-    // CHECK-NEXT: %[[MASK:.*]] = llvm.mlir.constant(16777215 : i32)
     // CHECK-NEXT: %[[KEY:.*]] = llvm.and %[[ADDRESS]], %[[MASK]] : i32
     %address = tti.experimental_memdesc_to_i32 %view : !ttg.memdesc<8x8xf32, #shared, #smem, mutable, 16x16>
     // CHECK: llvm.return %[[KEY]]

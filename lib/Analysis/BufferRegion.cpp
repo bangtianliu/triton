@@ -749,9 +749,8 @@ LogicalResult BufferRegionAnalysis::visitOperation(
 
     auto dstTy = memdescSubsliceOp.getType();
     auto addViews = [&](ArrayRef<int64_t> offsets) {
-      MemDescSubsliceOffsets relativeOffset =
-          getMemDescSubsliceUnpaddedOffsets(
-              memdescSubsliceOp.getSrc().getType(), offsets);
+      MemDescSubsliceOffsets relativeOffset = getMemDescSubsliceUnpaddedOffsets(
+          memdescSubsliceOp.getSrc().getType(), offsets);
       for (const BufferRegionView &view : in.views)
         regionInfo.views.insert(getSubView(
             dstTy, view, relativeOffset.storageOffset,

@@ -4435,37 +4435,6 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
 
 // -----
 
-//--- masked-store-barrier.mlir
-
-module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32, ttg.shared = 0 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32} {
-  // CONSAN-LABEL: @consan_masked_store_barrier
-  // NO-CONSAN-LABEL: @consan_masked_store_barrier
-  tt.func public @consan_masked_store_barrier(%masked: !tt.ptr<i32>, %unmasked: !tt.ptr<i32>, %value: i32, %mask: i1, %branch: i1) {
-    cf.cond_br %branch, ^masked_store, ^join
-  ^masked_store:
-    // CONSAN: st.global.b32{{.*}}, %arg0,
-    // CONSAN-NEXT: nvvm.barrier
-    // CONSAN-NEXT: llvm.br
-    // NO-CONSAN-NOT: nvvm.barrier
-    // NO-CONSAN: st.global.b32{{.*}}, %arg0,
-    // NO-CONSAN-NEXT: llvm.br
-    tt.store %masked, %value, %mask : !tt.ptr<i32>
-    cf.br ^join
-  ^join:
-    // CONSAN: st.global.b32{{.*}}, %arg1,
-    // CONSAN-NOT: nvvm.barrier
-    // CONSAN: llvm.return
-    // NO-CONSAN-NOT: nvvm.barrier
-    // NO-CONSAN: st.global.b32{{.*}}, %arg1,
-    // NO-CONSAN-NOT: nvvm.barrier
-    // NO-CONSAN: llvm.return
-    tt.store %unmasked, %value : !tt.ptr<i32>
-    tt.return
-  }
-}
-
-// -----
-
 #shared = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [0]}>
 #smem = #ttg.shared_memory
 module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32} {
@@ -4514,5 +4483,36 @@ module attributes {"ttg.num-ctas" = 2 : i32, "ttg.num-warps" = 4 : i32} {
     %view = ttg.memdesc_subslice %src[%row, 0] : !ttg.memdesc<4x32xi32, #shared, #smem> -> !ttg.memdesc<2x32xi32, #shared, #smem, 4x32>
     // CHECK-NEXT: llvm.return %[[POISON]]
     tt.return %view : !ttg.memdesc<2x32xi32, #shared, #smem, 4x32>
+  }
+}
+
+// -----
+
+//--- masked-store-barrier.mlir
+
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 4 : i32, "ttg.threads-per-warp" = 32 : i32, "ttg.total-num-warps" = 4 : i32, ttg.shared = 0 : i32, ttg.target = "cuda:90", ttg.tensor_memory_size = 0 : i32} {
+  // CONSAN-LABEL: @consan_masked_store_barrier
+  // NO-CONSAN-LABEL: @consan_masked_store_barrier
+  tt.func public @consan_masked_store_barrier(%masked: !tt.ptr<i32>, %unmasked: !tt.ptr<i32>, %value: i32, %mask: i1, %branch: i1) {
+    cf.cond_br %branch, ^masked_store, ^join
+  ^masked_store:
+    // CONSAN: st.global.b32{{.*}}, %arg0,
+    // CONSAN-NEXT: nvvm.barrier
+    // CONSAN-NEXT: llvm.br
+    // NO-CONSAN-NOT: nvvm.barrier
+    // NO-CONSAN: st.global.b32{{.*}}, %arg0,
+    // NO-CONSAN-NEXT: llvm.br
+    tt.store %masked, %value, %mask : !tt.ptr<i32>
+    cf.br ^join
+  ^join:
+    // CONSAN: st.global.b32{{.*}}, %arg1,
+    // CONSAN-NOT: nvvm.barrier
+    // CONSAN: llvm.return
+    // NO-CONSAN-NOT: nvvm.barrier
+    // NO-CONSAN: st.global.b32{{.*}}, %arg1,
+    // NO-CONSAN-NOT: nvvm.barrier
+    // NO-CONSAN: llvm.return
+    tt.store %unmasked, %value : !tt.ptr<i32>
+    tt.return
   }
 }

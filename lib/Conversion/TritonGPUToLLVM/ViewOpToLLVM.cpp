@@ -511,8 +511,10 @@ struct MemDescSubsliceOpConversion
         for (auto [i, base] : llvm::enumerate(newBases))
           base = b.extract_element(basesVec, b.xor_(shift, b.i32_val(i)));
       } else {
+        // Keep negative poison offsets from producing an invalid base index.
         unsigned partitionShift =
-            (layoutStaticOffsets[dim] / pieceSize) % part.getNumPartitions();
+            (static_cast<uint32_t>(layoutStaticOffsets[dim]) / pieceSize) %
+            part.getNumPartitions();
         SmallVector<Value> rotated(newBases.size());
         for (size_t i = 0; i < newBases.size(); ++i)
           rotated[i] = newBases[i ^ partitionShift];

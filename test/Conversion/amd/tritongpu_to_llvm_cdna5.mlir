@@ -210,11 +210,15 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
     // GFX1250: %[[STRIDE:.*]] = llvm.mlir.constant(128 : i32)
     // GFX1250: %[[PREFIX:.*]] = llvm.mul %arg1, %[[STRIDE]] : i32
     // GFX1250-COUNT-2: llvm.getelementptr %{{.*}}[%[[PREFIX]]]
+    // GFX1250: %[[PIECE_SIZE:.*]] = llvm.mlir.constant(8 : i32)
+    // GFX1250: %[[PIECE:.*]] = llvm.udiv %arg2, %[[PIECE_SIZE]] : i32
+    // GFX1250: %[[PARTITION_COUNT:.*]] = llvm.mlir.constant(2 : i32)
+    // GFX1250: %[[PARTITION_SHIFT:.*]] = llvm.urem %[[PIECE]], %[[PARTITION_COUNT]] : i32
     // GFX1250: llvm.insertelement
     // GFX1250: %[[BASES:.*]] = llvm.insertelement
-    // GFX1250: %[[SELECT0:.*]] = llvm.xor %{{.*}}, %{{.*}} : i32
+    // GFX1250: %[[SELECT0:.*]] = llvm.xor %[[PARTITION_SHIFT]], %{{.*}} : i32
     // GFX1250-NEXT: %[[BASE0:.*]] = llvm.extractelement %[[BASES]][%[[SELECT0]] : i32] : vector<2x!llvm.ptr<3>>
-    // GFX1250: %[[SELECT1:.*]] = llvm.xor %{{.*}}, %{{.*}} : i32
+    // GFX1250: %[[SELECT1:.*]] = llvm.xor %[[PARTITION_SHIFT]], %{{.*}} : i32
     // GFX1250-NEXT: %[[BASE1:.*]] = llvm.extractelement %[[BASES]][%[[SELECT1]] : i32] : vector<2x!llvm.ptr<3>>
     // GFX1250: llvm.insertvalue %[[BASE0]],
     // GFX1250: llvm.insertvalue %[[BASE1]],
@@ -237,6 +241,35 @@ module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.thr
     // GFX1250: llvm.return
     %view = ttg.memdesc_subslice %src[%stage, 8, 0] : !ttg.memdesc<5x16x16xf16, #dynamic_partitioned, #ttg.shared_memory> -> !ttg.memdesc<2x8x16xf16, #dynamic_partitioned, #ttg.shared_memory, 5x16x16>
     tt.return %view : !ttg.memdesc<2x8x16xf16, #dynamic_partitioned, #ttg.shared_memory, 5x16x16>
+  }
+}
+
+// -----
+
+#nested_inner = #ttg.swizzled_shared<{vec = 1, perPhase = 1, maxPhase = 1, order = [1, 0]}>
+#nested_partitioned = #ttg.partitioned_shared<{numPartitions = 2, numGroups = 2, partitionDim = 1, partitionLayout = #nested_inner}>
+module attributes {"ttg.num-ctas" = 1 : i32, "ttg.num-warps" = 2 : i32, "ttg.threads-per-warp" = 32 : i32} {
+  // GFX1250-LABEL: @dynamic_subslice_partitioned_nested_column
+  tt.func private @dynamic_subslice_partitioned_nested_column(%src: !ttg.memdesc<16x64xf16, #nested_partitioned, #ttg.shared_memory>, %column: i32) -> !ttg.memdesc<16x8xf16, #nested_partitioned, #ttg.shared_memory, 16x64> {
+    %outer = ttg.memdesc_subslice %src[0, 16] : !ttg.memdesc<16x64xf16, #nested_partitioned, #ttg.shared_memory> -> !ttg.memdesc<16x16xf16, #nested_partitioned, #ttg.shared_memory, 16x64>
+    // Derive the rotation from the relative column and the allocation shape.
+    // GFX1250: llvm.add %{{.*}}, %arg1 : i32
+    // GFX1250-NEXT: %[[COLUMN_PIECE_SIZE:.*]] = llvm.mlir.constant(16 : i32)
+    // GFX1250-NEXT: %[[COLUMN_PIECE:.*]] = llvm.udiv %arg1, %[[COLUMN_PIECE_SIZE]] : i32
+    // GFX1250: %[[COLUMN_PARTITIONS:.*]] = llvm.mlir.constant(2 : i32)
+    // GFX1250: %[[COLUMN_SHIFT:.*]] = llvm.urem %[[COLUMN_PIECE]], %[[COLUMN_PARTITIONS]] : i32
+    // GFX1250: %[[COLUMN_SELECT:.*]] = llvm.xor %[[COLUMN_SHIFT]], %{{.*}} : i32
+    // GFX1250-NEXT: llvm.extractelement
+    %inner = ttg.memdesc_subslice %outer[0, %column] : !ttg.memdesc<16x16xf16, #nested_partitioned, #ttg.shared_memory, 16x64> -> !ttg.memdesc<16x8xf16, #nested_partitioned, #ttg.shared_memory, 16x64>
+    tt.return %inner : !ttg.memdesc<16x8xf16, #nested_partitioned, #ttg.shared_memory, 16x64>
+  }
+
+  // Negative offsets produce poison descriptors but must compile safely.
+  // GFX1250-LABEL: @subslice_partitioned_negative_offset
+  tt.func private @subslice_partitioned_negative_offset(%src: !ttg.memdesc<16x64xf16, #nested_partitioned, #ttg.shared_memory>) -> !ttg.memdesc<16x16xf16, #nested_partitioned, #ttg.shared_memory, 16x64> {
+    %view = ttg.memdesc_subslice %src[0, -16] : !ttg.memdesc<16x64xf16, #nested_partitioned, #ttg.shared_memory> -> !ttg.memdesc<16x16xf16, #nested_partitioned, #ttg.shared_memory, 16x64>
+    // GFX1250: llvm.return
+    tt.return %view : !ttg.memdesc<16x16xf16, #nested_partitioned, #ttg.shared_memory, 16x64>
   }
 }
 

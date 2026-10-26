@@ -2552,7 +2552,7 @@ tt.func @dynamic_subslice_prefix_backedge(%input: tensor<128xi32, #writer>, %ub:
   %c0 = arith.constant 0 : i32
   %c1 = arith.constant 1 : i32
   %alloc = ttg.local_alloc : () -> !ttg.memdesc<3x128xi32, #shared, #smem, mutable>
-  // CHECK: scf.for
+  // CHECK: cf.cond_br
   scf.for %i = %c0 to %ub step %c1 : i32 {
     %offset = arith.andi %i, %c1 : i32
     %window = ttg.memdesc_subslice %alloc[%offset, 0] : !ttg.memdesc<3x128xi32, #shared, #smem, mutable> -> !ttg.memdesc<2x128xi32, #shared, #smem, mutable, 3x128>
