@@ -530,9 +530,9 @@ class shared_memory_descriptor(base_value):
         Create a subview of shared memory by slicing along a given dimension.
 
         Args:
-            start (int): The starting index of the slice.
-            length (int): The length of the slice.
-            dim (int): The dimension to slice (default: 0).
+            start (int or tensor): The starting index of the slice.
+            length (int): The compile-time length of the slice.
+            dim (int): The compile-time dimension to slice (default: 0).
 
         Returns:
             shared_memory_descriptor: Descriptor for the sliced subview.

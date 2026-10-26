@@ -2500,6 +2500,48 @@ def test_memdesc_subslice(M, N, M_tile_size, N_tile_size, shared_layout_cfg, dev
     torch.testing.assert_close(out, out_ref, rtol=0, atol=0)
 
 
+@pytest.mark.skipif(not is_hip(), reason="PartitionedSharedLayout requires the AMD backend")
+@pytest.mark.parametrize("partition_dim", [0, 1])
+@pytest.mark.parametrize("num_groups", [1, 2])
+@pytest.mark.parametrize("partition_layout_type", ["swizzled", "padded"])
+@pytest.mark.parametrize("inner_half", [0, 1])
+def test_memdesc_subslice_dynamic_partitioned(partition_dim, num_groups, partition_layout_type, inner_half, device):
+    M, N = 32, 64
+    piece_shape = [M, N]
+    piece_shape[partition_dim] //= 2 * num_groups
+    piece_size = piece_shape[partition_dim]
+    if partition_layout_type == "swizzled":
+        inner_layout = ttgl.SwizzledSharedLayout(vec=4, per_phase=1, max_phase=2, order=[1, 0])
+    else:
+        inner_layout = ttgl.PaddedSharedLayout.with_identity_for(interval_padding_pairs=[[16, 4]], shape=piece_shape,
+                                                                 order=[1, 0])
+    shared_layout = PartitionedSharedLayout(num_partitions=2, num_groups=num_groups, partition_dim=partition_dim,
+                                            partition_layout=inner_layout)
+    blocked_layout = ttgl.BlockedLayout([1, 4], [THREADS_PER_WARP // 4, 4], [4, 1], [1, 0])
+
+    @gluon.jit(do_not_specialize=["outer_start", "inner_start"])
+    def kernel(out, outer_start, inner_start, PIECE_SIZE: ttgl.constexpr, DIM: ttgl.constexpr, blocked: ttgl.constexpr,
+               shared: ttgl.constexpr):
+        rows = ttgl.arange(0, 32, layout=ttgl.SliceLayout(1, blocked))[:, None]
+        cols = ttgl.arange(0, 64, layout=ttgl.SliceLayout(0, blocked))[None, :]
+        offsets = rows * 64 + cols
+        values = ttgl.load(out + offsets)
+        smem = ttgl.allocate_shared_memory(ttgl.int32, (32, 64), shared, value=values)
+        outer = smem.slice(outer_start, PIECE_SIZE, dim=DIM)
+        inner = outer.slice(inner_start, PIECE_SIZE // 2, dim=DIM)
+        inner.store(inner.load(blocked) + 1000)
+        ttgl.store(out + offsets, smem.load(blocked))
+
+    inner_start = inner_half * (piece_size // 2)
+    out = torch.arange(M * N, device=device, dtype=torch.int32).reshape(M, N)
+    expected = out.clone()
+    selected = [slice(None), slice(None)]
+    selected[partition_dim] = slice(piece_size + inner_start, piece_size + inner_start + piece_size // 2)
+    expected[tuple(selected)] += 1000
+    kernel[(1, )](out, piece_size, inner_start, piece_size, partition_dim, blocked_layout, shared_layout, num_warps=4)
+    torch.testing.assert_close(out, expected, rtol=0, atol=0)
+
+
 @pytest.mark.skipif(not is_hopper_or_newer(), reason="num_ctas > 1 requires NVIDIA SM90+ (Hopper)")
 def test_memdesc_subslice_two_cta_broadcasted_cga(device):
     ALLOC = 512

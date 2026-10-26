@@ -845,10 +845,12 @@ AuxDataMap::getBuffersAndBarriers(ModuleOp module, FuncOp entryPoint,
         memType = MemType::TENSOR_MEM;
       if (!memType)
         continue;
-      candidates[static_cast<int>(*memType)].push_back(
-          {current, analysis->getLatticeElement(current)->getValue()});
-      if (auto select = current.getDefiningOp<arith::SelectOp>())
-        pending.append({select.getTrueValue(), select.getFalseValue()});
+      const RegionInfo &regionInfo =
+          analysis->getLatticeElement(current)->getValue();
+      candidates[static_cast<int>(*memType)].push_back({current, regionInfo});
+      if (!regionInfo.isUnknown())
+        if (auto select = current.getDefiningOp<arith::SelectOp>())
+          pending.append({select.getTrueValue(), select.getFalseValue()});
     }
   };
   SmallVector<BufferRegion> staticSharedRegions;
@@ -878,6 +880,12 @@ AuxDataMap::getBuffersAndBarriers(ModuleOp module, FuncOp entryPoint,
   });
 
   analysis->calculateUsedBufferRegions(entryPoint);
+  if (analysis->hasUnknownUsedBufferRegions(
+          BufferRegionAnalysis::RegionType::BARRIER)) {
+    entryPoint.emitError(
+        "ConSan requires exact buffer regions for barrier tracking");
+    return failure();
+  }
   barrierRegions = analysis->getAllUsedBufferRegions(
       BufferRegionAnalysis::RegionType::BARRIER);
 
